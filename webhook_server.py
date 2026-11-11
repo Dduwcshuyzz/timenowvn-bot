@@ -205,7 +205,9 @@ def extract_photo_images(html):
     urls = full or urls
     seen, out = set(), []
     for u in urls:
-        key = u.split("/", 3)[-1] if u.count("/") >= 3 else u
+        # Lọc trùng theo đường dẫn sau host, bỏ phần query (cùng 1 ảnh có
+        # thể xuất hiện ở 2 host CDN với chữ ký khác nhau).
+        key = u.split("/", 3)[-1].split("?")[0] if u.count("/") >= 3 else u
         if key not in seen:
             seen.add(key)
             out.append(u)
@@ -225,7 +227,9 @@ def fmt_num(n):
 
 
 def send_from_tikwm(chat_id, data):
-    """Gửi video/ảnh/nhạc từ dữ liệu TikWM. Trả True nếu đã gửi được."""
+    """Gửi đủ ảnh bìa + video + nhạc từ dữ liệu TikWM.
+    Trả tập hợp những gì đã gửi được: {"anh", "video", "nhac"}."""
+    sent = set()
     author = (data.get("author") or {})
     nick = author.get("nickname") or author.get("unique_id") or "TikTok"
     title = (data.get("title") or "").strip()
@@ -234,55 +238,103 @@ def send_from_tikwm(chat_id, data):
     if dur:
         caption += f"\n⏱ {dur}s • 👁 {fmt_num(data.get('play_count'))} • ❤️ {fmt_num(data.get('digg_count'))}"
 
-    # Bài đăng ảnh -> gửi lại từng ảnh.
+    def send_music(url):
+        try:
+            send_audio(chat_id, url, "🎵 Nhạc nền của video")
+            sent.add("nhac")
+            with LOCK:
+                LAST_MUSIC[chat_id] = url
+        except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn ảnh/video
+            log(f"Gửi nhạc lỗi: {e}")
+
+    # Bài đăng ảnh -> gửi lại từng ảnh, rồi gửi luôn file nhạc.
     images = data.get("images") or []
     if images:
+        ok = False
         for i, img in enumerate(images[:10]):
-            send_photo(chat_id, img, caption if i == 0 else "")
+            try:
+                send_photo(chat_id, img, caption if i == 0 else "")
+                ok = True
+            except Exception as e:  # noqa: BLE001 - ảnh lỗi thì gửi ảnh khác
+                log(f"Gửi ảnh {i} lỗi: {e}")
+        if ok:
+            sent.add("anh")
         if data.get("music"):
-            with LOCK:
-                LAST_MUSIC[chat_id] = data["music"]
-            send(chat_id, "🎵 Muốn lấy file nhạc MP3 thì nhắn: nhac")
-        return True
+            send_music(data["music"])
+        return sent
 
-    # Video -> gửi lại file video không logo (ưu tiên bản HD nếu có).
+    # Video -> ảnh bìa trước, rồi file video không logo, rồi file nhạc.
     play = data.get("hdplay") or data.get("play")
     if play:
+        cover = data.get("cover")
+        if cover:
+            try:
+                send_photo(chat_id, cover, caption)
+                sent.add("anh")
+            except Exception as e:  # noqa: BLE001 - bìa lỗi thì vẫn gửi video
+                log(f"Gửi ảnh bìa lỗi: {e}")
         size = int(data.get("size") or 0)
         if size > 45_000_000:
             send(chat_id, "Video nặng hơn 45MB nên bot không gửi file được, "
                           f"Huy bấm link này để tải: {play}")
         else:
             try:
-                send_video(chat_id, play, caption)
+                send_video(chat_id, play, "" if "anh" in sent else caption)
             except Exception:  # noqa: BLE001 - thử lại bằng link thường
                 send(chat_id, "Gửi video lỗi, thử lại bằng link tải trực tiếp:\n"
                               f"{play}")
+        sent.add("video")
         if data.get("music"):
-            with LOCK:
-                LAST_MUSIC[chat_id] = data["music"]
-            send(chat_id, "🎵 Muốn lấy file nhạc MP3 thì nhắn: nhac")
-        return True
+            send_music(data["music"])
+        return sent
 
     # Chỉ còn nhạc -> gửi file âm thanh.
     if data.get("music"):
         send_audio(chat_id, data["music"], caption)
-        return True
+        sent.add("nhac")
+        with LOCK:
+            LAST_MUSIC[chat_id] = data["music"]
+        return sent
 
-    return False
+    return sent
+
+
+def extract_music_url(html):
+    """Link nhạc nền trong HTML trang TikTok (music.playUrl).
+    URL nhạc không chứa chữ 'music', nó nằm trong object music của trang."""
+    html2 = html.replace("\\u002F", "/").replace("\\/", "/")
+    m = re.search(r'"music"\s*:\s*\{[^}]*?"playUrl"\s*:\s*"([^"]+)"', html2)
+    if m:
+        return m.group(1)
+    for m in re.finditer(r'"playUrl"\s*:\s*"([^"]+)"', html2):
+        if "audio" in m.group(1):
+            return m.group(1)
+    return None
 
 
 def handle_with_ytdlp(chat_id, url):
-    """Cách 2: tải thẳng từ TikTok bằng yt-dlp / đọc HTML trang."""
+    """Cách 2: tải thẳng từ TikTok bằng yt-dlp / đọc HTML trang.
+    Trả tập hợp những gì đã gửi được: {"anh", "video", "nhac"}."""
     # Đọc thử trang TikTok: resolve link ngắn, đồng thời lấy HTML để trích ảnh.
     final_url, html = fetch_tiktok_page(url)
+    sent = set()
     if "/photo/" in final_url:
         images = extract_photo_images(html)
         if not images:
             raise RuntimeError("không trích được ảnh từ trang TikTok")
         for i, img in enumerate(images[:10]):
             send_photo(chat_id, img, "🖼️ Ảnh TikTok" if i == 0 else "")
-        return
+        sent.add("anh")
+        music = extract_music_url(html)
+        if music:
+            try:
+                send_audio(chat_id, music, "🎵 Nhạc nền")
+                sent.add("nhac")
+                with LOCK:
+                    LAST_MUSIC[chat_id] = music
+            except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn ảnh
+                log(f"Gửi nhạc lỗi: {e}")
+        return sent
     info = ytdlp_info(url)
     video_url = best_video_url(info)
     if not video_url:
@@ -293,16 +345,44 @@ def handle_with_ytdlp(chat_id, url):
     caption = f"🎬 @{uploader}\n{title}"
     if dur:
         caption += f"\n⏱ {dur}s"
-    send_video(chat_id, video_url, caption)
+    thumb = info.get("thumbnail")
+    if thumb:
+        try:
+            send_photo(chat_id, thumb, caption)
+            sent.add("anh")
+        except Exception as e:  # noqa: BLE001 - bìa lỗi thì vẫn gửi video
+            log(f"Gửi ảnh bìa lỗi: {e}")
+    send_video(chat_id, video_url, "" if "anh" in sent else caption)
+    sent.add("video")
     audio = best_audio_url(info)
     if audio:
-        with LOCK:
-            LAST_MUSIC[chat_id] = audio
-        send(chat_id, "🎵 Muốn lấy file nhạc MP3 thì nhắn: nhac")
+        try:
+            send_audio(chat_id, audio, "🎵 Nhạc nền của video")
+            sent.add("nhac")
+            with LOCK:
+                LAST_MUSIC[chat_id] = audio
+        except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn video
+            log(f"Gửi nhạc lỗi: {e}")
+    return sent
+
+
+def send_done(chat_id, sent):
+    """Câu chốt sau khi tải xong: nói rõ đã gửi những gì."""
+    parts = []
+    if "anh" in sent:
+        parts.append("ảnh")
+    if "video" in sent:
+        parts.append("video")
+    if "nhac" in sent:
+        parts.append("nhạc MP3")
+    if not parts:
+        return
+    send(chat_id, "✅ Xong rồi Huy! Mình gửi " + ", ".join(parts) +
+                  " ở trên, thích cái nào thì tải cái đó nhé.")
 
 
 def handle_tiktok(chat_id, url):
-    send(chat_id, "⏳ Đang tải video, chờ mình vài giây nhé...")
+    send(chat_id, "⏳ Đang tải cho Huy đây, chờ mình vài giây nhé...")
     # Cách 1: API TikWM (nhanh). Lỗi thì sang cách 2.
     data = None
     try:
@@ -311,18 +391,23 @@ def handle_tiktok(chat_id, url):
         log(f"TikWM thất bại, chuyển sang yt-dlp: {e}")
     if data is not None:
         try:
-            if send_from_tikwm(chat_id, data):
-                return
+            sent = send_from_tikwm(chat_id, data)
         except Exception as e:  # noqa: BLE001 - fallback sang yt-dlp
             log(f"Gửi từ TikWM lỗi, chuyển sang yt-dlp: {e}")
+            sent = set()
+        if sent:
+            send_done(chat_id, sent)
+            return
         log("TikWM có dữ liệu nhưng không gửi được, chuyển sang yt-dlp")
     # Cách 2: yt-dlp / đọc HTML trang.
     try:
-        handle_with_ytdlp(chat_id, url)
+        sent = handle_with_ytdlp(chat_id, url)
     except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
         log(f"yt-dlp thất bại: {e}")
         send(chat_id, "Không tải được link này, thử lại sau vài phút nhé. "
                       "(Link vẫn công khai, do server tải đang bận.)")
+        return
+    send_done(chat_id, sent)
 
 
 def handle_update(update):
@@ -338,11 +423,11 @@ def handle_update(update):
     # ---- /start ----
     if low.startswith("/start"):
         card = ("👋 Chào bạn, mình là bot TimeNow.\n"
-                "Gửi link TikTok vào đây, mình tải video/ảnh/nhạc gửi lại "
-                "cho bạn nhé.\n\n"
-                "📌 Video -> gửi lại file video không logo\n"
-                "🖼️ Bài đăng ảnh -> gửi lại từng ảnh\n"
-                "🎵 Nhắn 'nhac' sau khi tải video để lấy file MP3")
+                "Gửi link TikTok vào đây, mình gửi đủ cả ảnh bìa, video "
+                "không logo và nhạc MP3 để bạn thích cái nào thì tải cái đó.\n\n"
+                "📌 Video -> ảnh bìa + file video + file nhạc\n"
+                "🖼️ Bài đăng ảnh -> từng ảnh + file nhạc\n"
+                "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải")
         if chat_id == ADMIN_CHAT_ID:
             card += "\n\nHuy cứ nhắn câu hỏi, mình trả lời như Muse nhé."
         send(chat_id, card)

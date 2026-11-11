@@ -1,11 +1,11 @@
 # Bot tải video TimeNow cho @timenowvn_bot
 
-Gửi link TikTok vào bot, bot tải qua API TikWM rồi gửi lại file video
-không logo (hoặc từng ảnh nếu là bài đăng ảnh). Nhắn "nhac" sau khi tải
-xong để lấy file nhạc MP3. Nếu TikWM bị chặn (Render dùng IP dùng chung
-hay bị giới hạn), bot tự chuyển sang cách 2: tải thẳng từ TikTok bằng
-yt-dlp (video) hoặc đọc HTML trang TikTok để trích ảnh (bài đăng ảnh).
-Huy nhắn câu hỏi thì bot trả lời như Muse.
+Gửi link TikTok vào bot, bot gửi đủ cả ảnh bìa, video không logo và nhạc
+MP3 một lần để thích cái nào thì tải cái đó (bài đăng ảnh thì gửi từng
+ảnh + nhạc). Nhắn "nhac" để gửi lại file nhạc của link vừa tải.
+Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tải qua API TikWM trước;
+nếu TikWM chặn IP server (đã gặp trên Render, lỗi 403) thì tự chuyển
+sang tải thẳng bằng yt-dlp (video) hoặc đọc HTML trang TikTok (bài ảnh).
 
 ## File trong thư mục này
 - `webhook_server.py` — server Python chuẩn + yt-dlp (cài ở buildCommand trong render.yaml)
