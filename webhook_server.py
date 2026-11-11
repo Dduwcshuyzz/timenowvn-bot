@@ -27,6 +27,7 @@ Xóa webhook (quay về polling): setWebhook?url=
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -57,6 +58,11 @@ URL_RE = re.compile(r"https?://\S+")
 TIKTOK_HOSTS = ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com")
 OTHER_VIDEO_HOSTS = ("youtube.com", "youtu.be", "instagram.com",
                      "facebook.com", "fb.watch", "x.com", "twitter.com")
+
+
+def log(*args):
+    # Render ghi stdout ra Logs, để xem lỗi tải thật khi cần.
+    print("[timenow]", *args, flush=True)
 
 
 def tg(method, payload):
@@ -104,23 +110,106 @@ def call_ai(user_text):
     return data["choices"][0]["message"]["content"].strip()
 
 
-def fetch_tiktok(url):
-    """Gọi API TikWM, thử lại tối đa 3 lần (API miễn phí lúc cao điểm hay bận)."""
+def fetch_tikwm(url):
+    """Gọi API TikWM, thử lại tối đa 2 lần. Trả dict data hoặc raise."""
     api_url = TIKWM_API + urllib.parse.quote(url, safe="")
     last_err = None
-    for _ in range(3):
+    for i in range(2):
         try:
             req = urllib.request.Request(api_url, headers={
                 "User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=12) as r:
                 data = json.load(r)
             if data.get("code") == 0 and data.get("data"):
                 return data["data"]
             last_err = data.get("msg", "API lỗi")
-        except Exception as e:  # noqa: BLE001 - thử lại lần sau
+        except Exception as e:  # noqa: BLE001 - thử lại / fallback sau
             last_err = e
-        time.sleep(2)
+        log(f"TikWM lần {i + 1} lỗi: {last_err}")
+        time.sleep(1)
     raise RuntimeError(f"TikWM lỗi: {last_err}")
+
+
+def ytdlp_info(url):
+    """Lấy metadata TikTok bằng yt-dlp (tải thẳng từ TikTok, không qua TikWM)."""
+    cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--dump-json",
+           "--no-download", "--no-warnings", url]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if r.returncode != 0:
+        raise RuntimeError("yt-dlp lỗi: " + (r.stderr or "").strip()[-300:])
+    return json.loads(r.stdout)
+
+
+def best_video_url(info):
+    """URL mp4 tốt nhất dưới 45MB (giới hạn gửi file của Telegram)."""
+    cands = []
+    for f in info.get("formats") or []:
+        if f.get("ext") != "mp4" or f.get("vcodec") in (None, "none"):
+            continue
+        if f.get("acodec") in (None, "none"):
+            continue
+        if not f.get("url"):
+            continue
+        size = f.get("filesize") or f.get("filesize_approx") or 0
+        if size and size > 45_000_000:
+            continue
+        cands.append((f.get("height") or 0, f["url"]))
+    if cands:
+        cands.sort()
+        return cands[-1][1]
+    if info.get("ext") == "mp4" and info.get("url"):
+        return info["url"]
+    return None
+
+
+def best_audio_url(info):
+    cands = []
+    for f in info.get("formats") or []:
+        if f.get("vcodec") not in (None, "none"):
+            continue
+        if f.get("acodec") in (None, "none") or not f.get("url"):
+            continue
+        cands.append((f.get("abr") or 0, f["url"]))
+    if cands:
+        cands.sort()
+        return cands[-1][1]
+    return None
+
+
+MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+             "Mobile/15E148 Safari/604.1")
+
+
+def fetch_tiktok_page(url):
+    """Đọc trang TikTok: vừa resolve link ngắn ra URL đầy đủ, vừa lấy HTML.
+    Trả (final_url, html). Lỗi thì trả (url, '')."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.geturl(), r.read().decode("utf-8", "ignore")
+    except Exception as e:  # noqa: BLE001 - caller sẽ fallback tiếp
+        log(f"Đọc trang TikTok lỗi: {e}")
+        return url, ""
+
+
+def extract_photo_images(html):
+    """Trích link ảnh bài đăng ảnh từ HTML trang TikTok (imagePost).
+    URL trong HTML có thể ở dạng thường hoặc escape JSON, nên gỡ escape
+    trước rồi tìm. Cùng 1 ảnh có thể xuất hiện ở 2 host CDN khác nhau
+    (p16/p19...) nên lọc trùng theo phần đường dẫn sau host."""
+    html = html.replace("\\u002F", "/").replace("\\/", "/")
+    urls = re.findall(r"https://[^\"'\\\s]+photomode-image[^\"'\\\s]*", html)
+    # Ưu tiên ảnh gốc, bỏ ảnh bìa/crop (image-cover).
+    full = [u for u in urls if "image-cover" not in u]
+    urls = full or urls
+    seen, out = set(), []
+    for u in urls:
+        key = u.split("/", 3)[-1] if u.count("/") >= 3 else u
+        if key not in seen:
+            seen.add(key)
+            out.append(u)
+    return out
 
 
 def fmt_num(n):
@@ -135,14 +224,8 @@ def fmt_num(n):
     return str(n)
 
 
-def handle_tiktok(chat_id, url):
-    send(chat_id, "⏳ Đang tải video, chờ mình vài giây nhé...")
-    try:
-        data = fetch_tiktok(url)
-    except Exception:  # noqa: BLE001 - báo lỗi gọn cho người dùng
-        send(chat_id, "Không tải được link này. Kiểm tra lại link có công khai "
-                      "không rồi gửi lại nhé.")
-        return
+def send_from_tikwm(chat_id, data):
+    """Gửi video/ảnh/nhạc từ dữ liệu TikWM. Trả True nếu đã gửi được."""
     author = (data.get("author") or {})
     nick = author.get("nickname") or author.get("unique_id") or "TikTok"
     title = (data.get("title") or "").strip()
@@ -160,7 +243,7 @@ def handle_tiktok(chat_id, url):
             with LOCK:
                 LAST_MUSIC[chat_id] = data["music"]
             send(chat_id, "🎵 Muốn lấy file nhạc MP3 thì nhắn: nhac")
-        return
+        return True
 
     # Video -> gửi lại file video không logo (ưu tiên bản HD nếu có).
     play = data.get("hdplay") or data.get("play")
@@ -179,14 +262,67 @@ def handle_tiktok(chat_id, url):
             with LOCK:
                 LAST_MUSIC[chat_id] = data["music"]
             send(chat_id, "🎵 Muốn lấy file nhạc MP3 thì nhắn: nhac")
-        return
+        return True
 
     # Chỉ còn nhạc -> gửi file âm thanh.
     if data.get("music"):
         send_audio(chat_id, data["music"], caption)
-        return
+        return True
 
-    send(chat_id, "Link này không có video hay ảnh, thử link khác nhé.")
+    return False
+
+
+def handle_with_ytdlp(chat_id, url):
+    """Cách 2: tải thẳng từ TikTok bằng yt-dlp / đọc HTML trang."""
+    # Đọc thử trang TikTok: resolve link ngắn, đồng thời lấy HTML để trích ảnh.
+    final_url, html = fetch_tiktok_page(url)
+    if "/photo/" in final_url:
+        images = extract_photo_images(html)
+        if not images:
+            raise RuntimeError("không trích được ảnh từ trang TikTok")
+        for i, img in enumerate(images[:10]):
+            send_photo(chat_id, img, "🖼️ Ảnh TikTok" if i == 0 else "")
+        return
+    info = ytdlp_info(url)
+    video_url = best_video_url(info)
+    if not video_url:
+        raise RuntimeError("yt-dlp không tìm được link video")
+    title = (info.get("title") or "").strip()
+    uploader = info.get("uploader") or ""
+    dur = info.get("duration") or 0
+    caption = f"🎬 @{uploader}\n{title}"
+    if dur:
+        caption += f"\n⏱ {dur}s"
+    send_video(chat_id, video_url, caption)
+    audio = best_audio_url(info)
+    if audio:
+        with LOCK:
+            LAST_MUSIC[chat_id] = audio
+        send(chat_id, "🎵 Muốn lấy file nhạc MP3 thì nhắn: nhac")
+
+
+def handle_tiktok(chat_id, url):
+    send(chat_id, "⏳ Đang tải video, chờ mình vài giây nhé...")
+    # Cách 1: API TikWM (nhanh). Lỗi thì sang cách 2.
+    data = None
+    try:
+        data = fetch_tikwm(url)
+    except Exception as e:  # noqa: BLE001 - fallback sang yt-dlp
+        log(f"TikWM thất bại, chuyển sang yt-dlp: {e}")
+    if data is not None:
+        try:
+            if send_from_tikwm(chat_id, data):
+                return
+        except Exception as e:  # noqa: BLE001 - fallback sang yt-dlp
+            log(f"Gửi từ TikWM lỗi, chuyển sang yt-dlp: {e}")
+        log("TikWM có dữ liệu nhưng không gửi được, chuyển sang yt-dlp")
+    # Cách 2: yt-dlp / đọc HTML trang.
+    try:
+        handle_with_ytdlp(chat_id, url)
+    except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
+        log(f"yt-dlp thất bại: {e}")
+        send(chat_id, "Không tải được link này, thử lại sau vài phút nhé. "
+                      "(Link vẫn công khai, do server tải đang bận.)")
 
 
 def handle_update(update):

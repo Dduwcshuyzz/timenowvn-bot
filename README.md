@@ -2,10 +2,13 @@
 
 Gửi link TikTok vào bot, bot tải qua API TikWM rồi gửi lại file video
 không logo (hoặc từng ảnh nếu là bài đăng ảnh). Nhắn "nhac" sau khi tải
-video để lấy file nhạc MP3. Huy nhắn câu hỏi thì bot trả lời như Muse.
+xong để lấy file nhạc MP3. Nếu TikWM bị chặn (Render dùng IP dùng chung
+hay bị giới hạn), bot tự chuyển sang cách 2: tải thẳng từ TikTok bằng
+yt-dlp (video) hoặc đọc HTML trang TikTok để trích ảnh (bài đăng ảnh).
+Huy nhắn câu hỏi thì bot trả lời như Muse.
 
 ## File trong thư mục này
-- `webhook_server.py` — server, chỉ dùng Python chuẩn, không cần cài thêm gì
+- `webhook_server.py` — server Python chuẩn + yt-dlp (cài ở buildCommand trong render.yaml)
 
 ## Cách triển khai (chọn 1)
 

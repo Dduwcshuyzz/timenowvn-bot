@@ -2,7 +2,7 @@ services:
   - type: web
     name: timenowvn-bot
     env: python
-    buildCommand: echo "no build needed"
+    buildCommand: pip install yt-dlp
     startCommand: python3 webhook_server.py
     plan: free
     envVars:
