@@ -6,6 +6,9 @@ MP3 một lần để thích cái nào thì tải cái đó (bài đăng ảnh t
 Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tải qua API TikWM trước;
 nếu TikWM chặn IP server (đã gặp trên Render, lỗi 403) thì tự chuyển
 sang tải thẳng bằng yt-dlp (video) hoặc đọc HTML trang TikTok (bài ảnh).
+File nhạc bot tải về rồi upload lại dạng MP3, vì gửi thẳng bằng link
+hay bị Telegram nhận nhầm thành file video .mp4 (link nhạc TikTok
+không có đuôi .mp3 và CDN trả sai Content-Type).
 
 ## File trong thư mục này
 - `webhook_server.py` — server Python chuẩn + yt-dlp (cài ở buildCommand trong render.yaml)
