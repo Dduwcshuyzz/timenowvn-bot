@@ -1,11 +1,17 @@
 # Bot tải video TimeNow cho @timenowvn_bot
 
-Gửi link TikTok vào bot, bot gửi đủ cả ảnh bìa, video không logo và nhạc
-MP3 một lần để thích cái nào thì tải cái đó (bài đăng ảnh thì gửi từng
-ảnh + nhạc). Nhắn "nhac" để gửi lại file nhạc của link vừa tải.
-Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tải qua API TikWM trước;
-nếu TikWM chặn IP server (đã gặp trên Render, lỗi 403) thì tự chuyển
-sang tải thẳng bằng yt-dlp (video) hoặc đọc HTML trang TikTok (bài ảnh).
+Gửi link TikTok / YouTube / Instagram / Facebook / X vào bot, bot gửi đủ
+cả ảnh bìa, video không logo và nhạc MP3 một lần để thích cái nào thì tải
+cái đó (bài đăng ảnh TikTok thì gửi từng ảnh + nhạc). Gửi nhiều link trong
+1 tin nhắn (tối đa 3) để tải hàng loạt. Sau khi tải xong có nút bấm: lấy lại
+nhạc, tải bản thường (480p), mở link gốc. Nhắn "nhac" để gửi lại file nhạc
+của link vừa tải. /help xem hướng dẫn, /thongke xem số link đã tải.
+Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tải TikTok qua API TikWM
+trước; nếu TikWM chặn IP server (đã gặp trên Render, lỗi 403) thì tự chuyển
+sang yt-dlp (video), nếu yt-dlp cũng bị TikTok chặn thì lấy link video từ
+HTML trang TikTok (playAddr). YouTube / Instagram / Facebook / X tải bằng
+yt-dlp rồi gộp hình + tiếng bằng ffmpeg (gói imageio-ffmpeg) vì các nền
+tảng này chỉ có luồng hình và tiếng riêng, không có sẵn file gộp.
 File nhạc bot tải về rồi upload lại dạng MP3, vì gửi thẳng bằng link
 hay bị Telegram nhận nhầm thành file video .mp4 (link nhạc TikTok
 không có đuôi .mp3 và CDN trả sai Content-Type).
@@ -49,5 +55,5 @@ rồi cron telegram-muse-poll sẽ nhận tin lại như trước.
 ## Lưu ý
 - Token bot và key AI chỉ để trong biến môi trường, không ghi vào code, không gửi trong chat.
 - Bot webhook sẽ không nhớ hết context Muse ở đây (VietMess, TimeNow...) trừ dòng mô tả ngắn trong SYSTEM_PROMPT của file. Muốn bot nhớ nhiều hơn thì sửa SYSTEM_PROMPT.
-- Hiện bot mới tải được TikTok. YouTube / Instagram / Facebook sẽ thêm sau.
+- Chỉ tải được nội dung công khai. TikTok trên server Render đôi lúc bị chặn (TikWM 403, yt-dlp chặn) nên có link phải gửi lại lần 2 mới tải được.
 - Shop bán hàng đã gỡ khỏi bot ngày 2026-11-11 theo ý Huy.
