@@ -252,11 +252,13 @@ def fetch_tikwm(url):
 
 
 def ytdlp_info(url):
-    """Lấy metadata bằng yt-dlp, thử lại 2 lần (TikTok hay chặn IP lúc cao điểm)."""
-    cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--dump-json",
-           "--no-download", "--no-warnings", url]
+    """Lấy metadata bằng yt-dlp, thử lại 2 lần (TikTok hay chặn IP lúc cao điểm).
+    YouTube thử client Android trước vì client web hay bị chặn IP datacenter."""
     last_err = None
-    for i in range(2):
+    for i, extra in enumerate((["--extractor-args",
+                                "youtube:player_client=android"], [])):
+        cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--dump-json",
+               "--no-download", "--no-warnings"] + extra + [url]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if r.returncode == 0:
             return json.loads(r.stdout)
@@ -277,24 +279,35 @@ def ffmpeg_exe():
 
 def download_merged(url, max_height=720):
     """Dùng yt-dlp tải video + nhạc rồi gộp thành 1 file mp4.
-    Trả (đường dẫn file, thư mục tạm). Raise nếu lỗi hoặc file quá 45MB."""
+    Trả (đường dẫn file, thư mục tạm). Raise nếu lỗi hoặc file quá 45MB.
+    YouTube thử client Android trước vì client web hay bị chặn IP datacenter."""
     tmpdir = tempfile.mkdtemp(prefix="timenow_dl_")
     out = os.path.join(tmpdir, "video.mp4")
-    cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--no-warnings",
-           "-f", (f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-                  f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]"),
-           "--merge-output-format", "mp4", "-o", out, url]
+    fmt = (f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
+           f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]")
     ff = ffmpeg_exe()
-    if ff:
-        cmd += ["--ffmpeg-location", ff]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-    if r.returncode != 0 or not os.path.exists(out):
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("yt-dlp tải lỗi: " + (r.stderr or "").strip()[-300:])
-    if os.path.getsize(out) > 45_000_000:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("Video nặng hơn 45MB")
-    return out, tmpdir
+    last_err = None
+    for extra in (["--extractor-args", "youtube:player_client=android"], []):
+        cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+               "-f", fmt, "--merge-output-format", "mp4",
+               "-o", out] + extra + [url]
+        if ff:
+            cmd += ["--ffmpeg-location", ff]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if r.returncode == 0 and os.path.exists(out):
+            if os.path.getsize(out) > 45_000_000:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise RuntimeError("Video nặng hơn 45MB")
+            return out, tmpdir
+        last_err = (r.stderr or "").strip()[-300:]
+        log(f"yt-dlp tải lỗi: {last_err}")
+        for f in os.listdir(tmpdir):
+            try:
+                os.remove(os.path.join(tmpdir, f))
+            except OSError:
+                pass
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    raise RuntimeError("yt-dlp tải lỗi: " + (last_err or ""))
 
 
 def mp4_urls(info):
