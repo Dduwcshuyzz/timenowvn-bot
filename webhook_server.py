@@ -4,11 +4,14 @@
 Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có người nhắn
 (webhook), server xử lý ngay tại chỗ, trả lời trong vài giây.
 
-- Gửi link TikTok vào bot -> bot tải qua API TikWM rồi gửi lại file
-  video không logo (hoặc từng ảnh nếu là bài đăng ảnh).
+- Gửi link TikTok / YouTube / Instagram / Facebook / X vào bot -> bot
+  gửi đủ ảnh bìa, video không logo và nhạc MP3 một lần.
+- Gửi nhiều link trong 1 tin nhắn (tối đa 3) -> bot tải từng cái.
+- Sau khi tải xong có nút bấm: lấy lại nhạc, tải bản thường, mở link gốc.
 - Nhắn "nhac" sau khi tải video -> bot gửi lại file nhạc MP3.
+- /help xem hướng dẫn, /thongke xem số link đã tải.
 - Huy (admin) nhắn câu hỏi -> bot trả lời như Muse qua AI (Groq).
-- Người lạ nhắn chữ không phải link -> chỉ hướng dẫn gửi link TikTok.
+- Người lạ nhắn chữ không phải link -> chỉ hướng dẫn gửi link.
 
 Chạy:  python3 webhook_server.py   (mặc định cổng 8080)
 Biến môi trường bắt buộc:
@@ -27,6 +30,7 @@ Xóa webhook (quay về polling): setWebhook?url=
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -46,6 +50,22 @@ LOCK = threading.Lock()
 
 # Nhạc MP3 của video TikTok vừa tải xong, theo chat_id — để nhắn "nhac" là lấy.
 LAST_MUSIC = {}
+# Thông tin link vừa tải xong, theo chat_id — để nút bấm lấy lại nhạc / bản thường.
+LAST_DOWNLOAD = {}
+# Thống kê trong bộ nhớ (reset khi server chạy lại).
+STATS = {"total": 0, "platforms": {}}
+
+
+def bump_stat(platform):
+    with LOCK:
+        STATS["total"] += 1
+        STATS["platforms"][platform] = STATS["platforms"].get(platform, 0) + 1
+
+
+def save_download(chat_id, **kw):
+    with LOCK:
+        d = LAST_DOWNLOAD.setdefault(chat_id, {})
+        d.update(kw)
 
 SYSTEM_PROMPT = (
     "Bạn là Muse, trợ lý của Huy (Le Duc Huy, CEO VietMess.Com, "
@@ -57,8 +77,23 @@ SYSTEM_PROMPT = (
 TIKWM_API = "https://www.tikwm.com/api/?url="
 URL_RE = re.compile(r"https?://\S+")
 TIKTOK_HOSTS = ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com")
-OTHER_VIDEO_HOSTS = ("youtube.com", "youtu.be", "instagram.com",
-                     "facebook.com", "fb.watch", "x.com", "twitter.com")
+# Nền tảng tải bằng yt-dlp (đã kiểm chứng YouTube, Instagram trên máy;
+# Facebook, X dùng chung cách tải, link riêng tư/khóa thì không tải được).
+PLATFORM_HOSTS = {
+    "youtube.com": "YouTube", "youtu.be": "YouTube",
+    "instagram.com": "Instagram",
+    "facebook.com": "Facebook", "fb.watch": "Facebook",
+    "x.com": "X", "twitter.com": "X",
+}
+
+
+def platform_of(host):
+    if host.endswith(TIKTOK_HOSTS):
+        return "TikTok"
+    for h, name in PLATFORM_HOSTS.items():
+        if host == h or host.endswith("." + h):
+            return name
+    return None
 
 
 def log(*args):
@@ -81,6 +116,11 @@ def send(chat_id, text):
         tg("sendMessage", {"chat_id": chat_id, "text": text[i:i + 4000]})
 
 
+def send_markup(chat_id, text, markup):
+    tg("sendMessage", {"chat_id": chat_id, "text": text[:4000],
+                       "reply_markup": markup})
+
+
 def send_video(chat_id, video_url, caption=""):
     tg("sendVideo", {"chat_id": chat_id, "video": video_url,
                      "caption": caption[:1000]})
@@ -99,40 +139,50 @@ def send_audio(chat_id, audio_url, caption=""):
 MAX_MUSIC_BYTES = 20_000_000
 
 
-def tg_multipart_audio(chat_id, path, filename, caption=""):
-    """Gửi file audio lên Telegram bằng multipart (file thật, có đuôi)."""
+def tg_multipart(method, field, path, filename, mime, chat_id, caption=""):
+    """Gửi file lên Telegram bằng multipart (file thật, có đuôi)."""
     boundary = "----timenow" + str(int(time.time() * 1000))
     body = bytearray()
 
-    def field(name, value):
+    def field_part(name, value):
         body.extend(
             f"--{boundary}\r\n"
             f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"
             f"{value}\r\n".encode("utf-8"))
 
-    field("chat_id", str(chat_id))
+    field_part("chat_id", str(chat_id))
     if caption:
-        field("caption", caption[:1000])
+        field_part("caption", caption[:1000])
     with open(path, "rb") as f:
         filedata = f.read()
-    mime = "audio/mpeg" if filename.endswith(".mp3") else "audio/mp4"
     body.extend(
         f"--{boundary}\r\n"
-        f"Content-Disposition: form-data; name=\"audio\"; "
+        f"Content-Disposition: form-data; name=\"{field}\"; "
         f"filename=\"{filename}\"\r\n"
         f"Content-Type: {mime}\r\n\r\n".encode("utf-8"))
     body.extend(filedata)
     body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TOKEN}/sendAudio",
+        f"https://api.telegram.org/bot{TOKEN}/{method}",
         data=bytes(body),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST")
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=180) as r:
         res = json.load(r)
     if not res.get("ok"):
         raise RuntimeError(f"Telegram lỗi: {res}")
     return res
+
+
+def tg_multipart_audio(chat_id, path, filename, caption=""):
+    mime = "audio/mpeg" if filename.endswith(".mp3") else "audio/mp4"
+    return tg_multipart("sendAudio", "audio", path, filename, mime,
+                        chat_id, caption)
+
+
+def tg_multipart_video(chat_id, path, filename, caption=""):
+    return tg_multipart("sendVideo", "video", path, filename, "video/mp4",
+                        chat_id, caption)
 
 
 def send_music_file(chat_id, url, caption="🎵 Nhạc nền của video"):
@@ -202,17 +252,53 @@ def fetch_tikwm(url):
 
 
 def ytdlp_info(url):
-    """Lấy metadata TikTok bằng yt-dlp (tải thẳng từ TikTok, không qua TikWM)."""
+    """Lấy metadata bằng yt-dlp, thử lại 2 lần (TikTok hay chặn IP lúc cao điểm)."""
     cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--dump-json",
            "--no-download", "--no-warnings", url]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-    if r.returncode != 0:
-        raise RuntimeError("yt-dlp lỗi: " + (r.stderr or "").strip()[-300:])
-    return json.loads(r.stdout)
+    last_err = None
+    for i in range(2):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        last_err = (r.stderr or "").strip()[-300:]
+        log(f"yt-dlp lần {i + 1} lỗi: {last_err}")
+        time.sleep(3)
+    raise RuntimeError("yt-dlp lỗi: " + (last_err or ""))
 
 
-def best_video_url(info):
-    """URL mp4 tốt nhất dưới 45MB (giới hạn gửi file của Telegram)."""
+def ffmpeg_exe():
+    """Đường dẫn ffmpeg tĩnh từ imageio-ffmpeg (để yt-dlp gộp hình + tiếng)."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def download_merged(url, max_height=720):
+    """Dùng yt-dlp tải video + nhạc rồi gộp thành 1 file mp4.
+    Trả (đường dẫn file, thư mục tạm). Raise nếu lỗi hoặc file quá 45MB."""
+    tmpdir = tempfile.mkdtemp(prefix="timenow_dl_")
+    out = os.path.join(tmpdir, "video.mp4")
+    cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+           "-f", (f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
+                  f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]"),
+           "--merge-output-format", "mp4", "-o", out, url]
+    ff = ffmpeg_exe()
+    if ff:
+        cmd += ["--ffmpeg-location", ff]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    if r.returncode != 0 or not os.path.exists(out):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("yt-dlp tải lỗi: " + (r.stderr or "").strip()[-300:])
+    if os.path.getsize(out) > 45_000_000:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("Video nặng hơn 45MB")
+    return out, tmpdir
+
+
+def mp4_urls(info):
+    """Các URL mp4 có cả hình + tiếng, xếp theo chiều cao tăng dần."""
     cands = []
     for f in info.get("formats") or []:
         if f.get("ext") != "mp4" or f.get("vcodec") in (None, "none"):
@@ -225,11 +311,25 @@ def best_video_url(info):
         if size and size > 45_000_000:
             continue
         cands.append((f.get("height") or 0, f["url"]))
+    cands.sort()
+    return cands
+
+
+def best_video_url(info):
+    """URL mp4 tốt nhất dưới 45MB (giới hạn gửi file của Telegram)."""
+    cands = mp4_urls(info)
     if cands:
-        cands.sort()
         return cands[-1][1]
     if info.get("ext") == "mp4" and info.get("url"):
         return info["url"]
+    return None
+
+
+def smallest_video_url(info):
+    """URL mp4 nhẹ nhất (bản thường cho nút bấm)."""
+    cands = mp4_urls(info)
+    if cands:
+        return cands[0][1]
     return None
 
 
@@ -255,13 +355,25 @@ MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
 def fetch_tiktok_page(url):
     """Đọc trang TikTok: vừa resolve link ngắn ra URL đầy đủ, vừa lấy HTML.
     Trả (final_url, html). Lỗi thì trả (url, '')."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.geturl(), r.read().decode("utf-8", "ignore")
-    except Exception as e:  # noqa: BLE001 - caller sẽ fallback tiếp
-        log(f"Đọc trang TikTok lỗi: {e}")
-        return url, ""
+    last_err = None
+    for i in range(2):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.geturl(), r.read().decode("utf-8", "ignore")
+        except Exception as e:  # noqa: BLE001 - thử lại rồi caller fallback tiếp
+            last_err = e
+            log(f"Đọc trang TikTok lần {i + 1} lỗi: {e}")
+            time.sleep(2)
+    log(f"Đọc trang TikTok lỗi: {last_err}")
+    return url, ""
+
+
+def extract_video_url(html):
+    """Link video trong HTML trang TikTok (video.playAddr)."""
+    html2 = html.replace("\\u002F", "/").replace("\\/", "/")
+    m = re.search(r'"playAddr"\s*:\s*"([^"]+)"', html2)
+    return m.group(1) if m else None
 
 
 def extract_photo_images(html):
@@ -297,7 +409,7 @@ def fmt_num(n):
     return str(n)
 
 
-def send_from_tikwm(chat_id, data):
+def send_from_tikwm(chat_id, data, url):
     """Gửi đủ ảnh bìa + video + nhạc từ dữ liệu TikWM.
     Trả tập hợp những gì đã gửi được: {"anh", "video", "nhac"}."""
     sent = set()
@@ -332,6 +444,8 @@ def send_from_tikwm(chat_id, data):
             sent.add("anh")
         if data.get("music"):
             send_music(data["music"])
+        save_download(chat_id, orig=url, platform="TikTok",
+                      music=data.get("music"))
         return sent
 
     # Video -> ảnh bìa trước, rồi file video không logo, rồi file nhạc.
@@ -357,6 +471,11 @@ def send_from_tikwm(chat_id, data):
         sent.add("video")
         if data.get("music"):
             send_music(data["music"])
+        hd = data.get("hdplay")
+        sd = data.get("play")
+        save_download(chat_id, orig=url, platform="TikTok",
+                      music=data.get("music"), hd=hd,
+                      sd=sd if sd and sd != hd else None)
         return sent
 
     # Chỉ còn nhạc -> gửi file âm thanh.
@@ -365,6 +484,8 @@ def send_from_tikwm(chat_id, data):
         sent.add("nhac")
         with LOCK:
             LAST_MUSIC[chat_id] = data["music"]
+        save_download(chat_id, orig=url, platform="TikTok",
+                      music=data["music"])
         return sent
 
     return sent
@@ -405,8 +526,30 @@ def handle_with_ytdlp(chat_id, url):
                     LAST_MUSIC[chat_id] = music
             except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn ảnh
                 log(f"Gửi nhạc lỗi: {e}")
+        save_download(chat_id, orig=url, platform="TikTok", music=music)
         return sent
-    info = ytdlp_info(url)
+    # Video: yt-dlp lấy link mp4 có cả hình + tiếng; lỗi thì lấy link
+    # video từ HTML trang (TikTok hay chặn yt-dlp lúc cao điểm).
+    try:
+        info = ytdlp_info(url)
+    except Exception as e:  # noqa: BLE001 - fallback: lấy link video từ HTML
+        log(f"yt-dlp lỗi, thử lấy link video từ HTML trang: {e}")
+        vurl = extract_video_url(html)
+        if not vurl:
+            raise
+        send_video(chat_id, vurl, "🎬 Video TikTok")
+        sent.add("video")
+        music = extract_music_url(html)
+        if music:
+            try:
+                send_music_file(chat_id, music, "🎵 Nhạc nền")
+                sent.add("nhac")
+                with LOCK:
+                    LAST_MUSIC[chat_id] = music
+            except Exception as e2:  # noqa: BLE001 - nhạc lỗi thì vẫn còn video
+                log(f"Gửi nhạc lỗi: {e2}")
+        save_download(chat_id, orig=url, platform="TikTok", music=music)
+        return sent
     video_url = best_video_url(info)
     if not video_url:
         raise RuntimeError("yt-dlp không tìm được link video")
@@ -426,6 +569,9 @@ def handle_with_ytdlp(chat_id, url):
     send_video(chat_id, video_url, "" if "anh" in sent else caption)
     sent.add("video")
     audio = best_audio_url(info)
+    sd = smallest_video_url(info)
+    save_download(chat_id, orig=url, platform="TikTok", music=audio,
+                  hd=video_url, sd=sd if sd and sd != video_url else None)
     if audio:
         try:
             send_music_file(chat_id, audio, "🎵 Nhạc nền của video")
@@ -437,8 +583,71 @@ def handle_with_ytdlp(chat_id, url):
     return sent
 
 
-def send_done(chat_id, sent):
-    """Câu chốt sau khi tải xong: nói rõ đã gửi những gì."""
+def handle_generic(chat_id, url, platform):
+    """Tải video YouTube / Instagram / Facebook / X: tải + gộp rồi upload file.
+    (Các nền tảng này chỉ có luồng hình và tiếng riêng, không có sẵn file gộp.)"""
+    send(chat_id, f"⏳ Đang tải {platform} cho Huy đây, chờ mình khoảng 1 phút nhé...")
+    try:
+        info = ytdlp_info(url)
+    except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
+        log(f"yt-dlp {platform} thất bại: {e}")
+        send(chat_id, f"Không tải được link {platform} này, thử lại sau vài phút nhé. "
+                      "(Chỉ tải được video công khai.)")
+        return
+    title = (info.get("title") or "").strip()
+    uploader = info.get("uploader") or ""
+    dur = info.get("duration") or 0
+    caption = f"🎬 {platform} • @{uploader}\n{title}"
+    if dur:
+        caption += f"\n⏱ {dur // 60}:{dur % 60:02d}"
+    sent = set()
+    thumb = info.get("thumbnail")
+    if thumb:
+        try:
+            send_photo(chat_id, thumb, caption)
+            sent.add("anh")
+        except Exception as e:  # noqa: BLE001 - bìa lỗi thì vẫn gửi video
+            log(f"Gửi ảnh bìa lỗi: {e}")
+    # Tải + gộp hình/tiếng thành 1 file mp4, thử 720p rồi 480p nếu nặng quá.
+    path = tmpdir = None
+    try:
+        path, tmpdir = download_merged(url, 720)
+    except Exception as e:  # noqa: BLE001 - thử 480p
+        log(f"Tải {platform} 720p lỗi: {e}, thử 480p")
+        try:
+            path, tmpdir = download_merged(url, 480)
+        except Exception as e2:  # noqa: BLE001 - báo lỗi gọn cho người dùng
+            log(f"Tải {platform} 480p lỗi: {e2}")
+            send(chat_id, f"Không tải được video {platform} này (nặng quá hoặc "
+                          "link lỗi), thử link khác nhé.")
+            return
+    try:
+        tg_multipart_video(chat_id, path, "video.mp4",
+                           "" if "anh" in sent else caption)
+        sent.add("video")
+    except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
+        log(f"Upload video {platform} lỗi: {e}")
+        send(chat_id, f"Gửi video {platform} lỗi, thử lại sau nhé.")
+        return
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    audio = best_audio_url(info)
+    save_download(chat_id, orig=url, platform=platform, music=audio)
+    if audio:
+        try:
+            send_music_file(chat_id, audio, "🎵 Nhạc nền của video")
+            sent.add("nhac")
+            with LOCK:
+                LAST_MUSIC[chat_id] = audio
+        except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn video
+            log(f"Gửi nhạc lỗi: {e}")
+    bump_stat(platform)
+    send_done(chat_id, sent, url)
+
+
+def send_done(chat_id, sent, orig_url):
+    """Câu chốt sau khi tải xong: nói rõ đã gửi những gì + nút bấm."""
     parts = []
     if "anh" in sent:
         parts.append("ảnh")
@@ -448,8 +657,59 @@ def send_done(chat_id, sent):
         parts.append("nhạc MP3")
     if not parts:
         return
-    send(chat_id, "✅ Xong rồi Huy! Mình gửi " + ", ".join(parts) +
-                  " ở trên, thích cái nào thì tải cái đó nhé.")
+    text = ("✅ Xong rồi Huy! Mình gửi " + ", ".join(parts) +
+            " ở trên, thích cái nào thì tải cái đó nhé.")
+    dl = LAST_DOWNLOAD.get(chat_id) or {}
+    row = []
+    if dl.get("music"):
+        row.append({"text": "🎵 Lấy lại nhạc", "callback_data": "dl:music"})
+    # Nền tảng đa luồng (YouTube/IG/FB/X): nút bản thường tải lại bản 480p.
+    if dl.get("sd") or dl.get("platform") in ("YouTube", "Instagram",
+                                             "Facebook", "X"):
+        row.append({"text": "📥 Bản thường", "callback_data": "dl:sd"})
+    kb = {"inline_keyboard": []}
+    if row:
+        kb["inline_keyboard"].append(row)
+    if orig_url:
+        kb["inline_keyboard"].append(
+            [{"text": "🔗 Mở link gốc", "url": orig_url}])
+    send_markup(chat_id, text, kb)
+
+
+def handle_callback(chat_id, data):
+    """Xử lý nút bấm dưới tin 'Xong rồi'."""
+    dl = LAST_DOWNLOAD.get(chat_id) or {}
+    if data == "dl:music":
+        music = dl.get("music")
+        if music:
+            try:
+                send_music_file(chat_id, music, "🎵 Nhạc nền TikTok")
+            except Exception:  # noqa: BLE001 - gửi link thay cho file
+                send(chat_id, f"Gửi file nhạc lỗi, Huy bấm link này để tải: {music}")
+        else:
+            send(chat_id, "Link vừa tải không có nhạc.")
+    elif data == "dl:sd":
+        sd = dl.get("sd")
+        if sd:
+            send_video(chat_id, sd, "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
+        elif dl.get("platform") in ("YouTube", "Instagram", "Facebook", "X") \
+                and dl.get("orig"):
+            send(chat_id, "⏳ Đang tải bản thường, chờ mình chút nhé...")
+            path = tmpdir = None
+            try:
+                path, tmpdir = download_merged(dl["orig"], 480)
+                tg_multipart_video(chat_id, path, "video.mp4",
+                                   "📥 Bản thường (480p)")
+            except Exception as e:  # noqa: BLE001 - báo lỗi gọn
+                log(f"Tải bản thường lỗi: {e}")
+                send(chat_id, "Tải bản thường lỗi, thử lại sau nhé.")
+            finally:
+                if tmpdir:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+        else:
+            send(chat_id, "Link vừa tải không có bản thường.")
+    else:
+        send(chat_id, "Nút này mình chưa hiểu, gửi lại link nhé.")
 
 
 def handle_tiktok(chat_id, url):
@@ -462,12 +722,13 @@ def handle_tiktok(chat_id, url):
         log(f"TikWM thất bại, chuyển sang yt-dlp: {e}")
     if data is not None:
         try:
-            sent = send_from_tikwm(chat_id, data)
+            sent = send_from_tikwm(chat_id, data, url)
         except Exception as e:  # noqa: BLE001 - fallback sang yt-dlp
             log(f"Gửi từ TikWM lỗi, chuyển sang yt-dlp: {e}")
             sent = set()
         if sent:
-            send_done(chat_id, sent)
+            bump_stat("TikTok")
+            send_done(chat_id, sent, url)
             return
         log("TikWM có dữ liệu nhưng không gửi được, chuyển sang yt-dlp")
     # Cách 2: yt-dlp / đọc HTML trang.
@@ -478,10 +739,23 @@ def handle_tiktok(chat_id, url):
         send(chat_id, "Không tải được link này, thử lại sau vài phút nhé. "
                       "(Link vẫn công khai, do server tải đang bận.)")
         return
-    send_done(chat_id, sent)
+    bump_stat("TikTok")
+    send_done(chat_id, sent, url)
 
 
 def handle_update(update):
+    # ---- Nút bấm inline dưới tin "Xong rồi" ----
+    cq = update.get("callback_query")
+    if cq:
+        chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id")
+        if chat_id:
+            try:
+                tg("answerCallbackQuery", {"callback_query_id": cq.get("id")})
+            except Exception:  # noqa: BLE001 - bấm nút vẫn chạy tiếp
+                pass
+            handle_callback(chat_id, cq.get("data") or "")
+        return
+
     msg = update.get("message") or update.get("edited_message") or {}
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
@@ -494,14 +768,44 @@ def handle_update(update):
     # ---- /start ----
     if low.startswith("/start"):
         card = ("👋 Chào bạn, mình là bot TimeNow.\n"
-                "Gửi link TikTok vào đây, mình gửi đủ cả ảnh bìa, video "
+                "Gửi link vào đây, mình gửi đủ cả ảnh bìa, video "
                 "không logo và nhạc MP3 để bạn thích cái nào thì tải cái đó.\n\n"
-                "📌 Video -> ảnh bìa + file video + file nhạc\n"
-                "🖼️ Bài đăng ảnh -> từng ảnh + file nhạc\n"
-                "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải")
+                "📱 Tải được: TikTok, YouTube, Instagram, Facebook, X\n"
+                "📎 Gửi nhiều link trong 1 tin nhắn (tối đa 3) để tải hàng loạt\n"
+                "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải\n"
+                "ℹ️ /help xem hướng dẫn, /thongke xem số link đã tải")
         if chat_id == ADMIN_CHAT_ID:
             card += "\n\nHuy cứ nhắn câu hỏi, mình trả lời như Muse nhé."
         send(chat_id, card)
+        return
+
+    # ---- /help ----
+    if low.startswith("/help"):
+        send(chat_id,
+             "📖 Hướng dẫn dùng bot TimeNow\n\n"
+             "📎 Gửi link video vào đây, bot tải về gửi lại cho bạn:\n"
+             "• TikTok — ảnh bìa + video không logo + nhạc MP3\n"
+             "• YouTube, Instagram, Facebook, X — video + ảnh bìa + nhạc\n"
+             "• Gửi nhiều link trong 1 tin nhắn (tối đa 3) để tải hàng loạt\n\n"
+             "🔘 Sau khi tải xong, bấm nút dưới tin nhắn để:\n"
+             "• Lấy lại file nhạc MP3\n"
+             "• Tải bản thường (nhẹ hơn, nhanh hơn)\n"
+             "• Mở link gốc\n\n"
+             "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải.\n"
+             "📊 /thongke xem số link bot đã tải.\n\n"
+             "Chỉ tải được nội dung công khai thôi nhé.")
+        return
+
+    # ---- /thongke ----
+    if low.startswith("/thongke"):
+        with LOCK:
+            total = STATS["total"]
+            parts = dict(STATS["platforms"])
+        lines = [f"📊 Bot đã tải {total} link."]
+        for name, n in sorted(parts.items(), key=lambda kv: -kv[1]):
+            lines.append(f"• {name}: {n}")
+        lines.append("(Số liệu từ lúc server chạy lại.)")
+        send(chat_id, "\n".join(lines))
         return
 
     # ---- Lấy nhạc MP3 của video vừa tải ----
@@ -517,19 +821,21 @@ def handle_update(update):
             send(chat_id, "Bạn chưa tải video nào, gửi link TikTok trước nhé.")
         return
 
-    # ---- Có link trong tin nhắn ----
-    m = URL_RE.search(text)
-    if m:
-        url = m.group(0).rstrip(").,")
-        host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
-        if host.endswith(TIKTOK_HOSTS) or host in TIKTOK_HOSTS:
-            handle_tiktok(chat_id, url)
-        elif any(host.endswith(h) or host == h for h in OTHER_VIDEO_HOSTS):
-            send(chat_id, "Hiện bot mới tải được TikTok thôi, YouTube / "
-                          "Instagram / Facebook sẽ thêm sau nhé.")
-        else:
-            send(chat_id, "Link này bot chưa tải được, hiện mới tải được "
-                          "link TikTok thôi nhé.")
+    # ---- Có link trong tin nhắn (tối đa 3 link 1 lần) ----
+    urls = [u.rstrip(").,") for u in URL_RE.findall(text)][:3]
+    if urls:
+        if len(urls) > 1:
+            send(chat_id, f"Tìm thấy {len(urls)} link, mình tải từng cái nhé...")
+        for url in urls:
+            host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+            platform = platform_of(host)
+            if platform == "TikTok":
+                handle_tiktok(chat_id, url)
+            elif platform:
+                handle_generic(chat_id, url, platform)
+            else:
+                send(chat_id, "Link này bot chưa tải được, hiện tải được "
+                              "TikTok, YouTube, Instagram, Facebook, X nhé.")
         return
 
     # ---- Hỏi đáp Muse (chỉ Huy) ----
@@ -546,8 +852,8 @@ def handle_update(update):
 
     # ---- Người lạ nhắn chữ ----
     if text:
-        send(chat_id, "Gửi link TikTok vào đây, mình tải video/ảnh/nhạc "
-                      "gửi lại cho bạn nhé.")
+        send(chat_id, "Gửi link TikTok, YouTube, Instagram, Facebook hoặc X "
+                      "vào đây, mình tải video/ảnh/nhạc gửi lại cho bạn nhé.")
 
 
 class Handler(BaseHTTPRequestHandler):
