@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: timenowvn-bot
+    env: python
+    buildCommand: echo "no build needed"
+    startCommand: python3 webhook_server.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_API_BASE
+        value: https://api.groq.com/openai/v1
+      - key: AI_MODEL
+        value: llama-3.3-70b-versatile
+      - key: ADMIN_CHAT_ID
+        value: "7223454879"
