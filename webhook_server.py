@@ -252,10 +252,13 @@ def fetch_tikwm(url):
 
 
 def ytdlp_info(url):
-    """Lấy metadata bằng yt-dlp, thử lại 2 lần (TikTok hay chặn IP lúc cao điểm).
-    YouTube thử client Android trước vì client web hay bị chặn IP datacenter."""
+    """Lấy metadata bằng yt-dlp, thử lại 3 lần (TikTok hay chặn IP lúc cao điểm).
+    YouTube thử client tv_embedded rồi Android trước vì client web hay bị
+    chặn IP datacenter (lỗi 'Failed to extract any player response')."""
     last_err = None
     for i, extra in enumerate((["--extractor-args",
+                                "youtube:player_client=tv_embedded"],
+                               ["--extractor-args",
                                 "youtube:player_client=android"], [])):
         cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--dump-json",
                "--no-download", "--no-warnings"] + extra + [url]
@@ -280,14 +283,16 @@ def ffmpeg_exe():
 def download_merged(url, max_height=720):
     """Dùng yt-dlp tải video + nhạc rồi gộp thành 1 file mp4.
     Trả (đường dẫn file, thư mục tạm). Raise nếu lỗi hoặc file quá 45MB.
-    YouTube thử client Android trước vì client web hay bị chặn IP datacenter."""
+    YouTube thử client tv_embedded rồi Android trước vì client web hay bị
+    chặn IP datacenter (lỗi 'Failed to extract any player response')."""
     tmpdir = tempfile.mkdtemp(prefix="timenow_dl_")
     out = os.path.join(tmpdir, "video.mp4")
     fmt = (f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]")
     ff = ffmpeg_exe()
     last_err = None
-    for extra in (["--extractor-args", "youtube:player_client=android"], []):
+    for extra in (["--extractor-args", "youtube:player_client=tv_embedded"],
+                  ["--extractor-args", "youtube:player_client=android"], []):
         cmd = ["python3", "-m", "yt_dlp", "--no-playlist", "--no-warnings",
                "-f", fmt, "--merge-output-format", "mp4",
                "-o", out] + extra + [url]
