@@ -2,7 +2,7 @@ services:
   - type: web
     name: timenowvn-bot
     env: python
-    buildCommand: pip install yt-dlp
+    buildCommand: pip install yt-dlp imageio-ffmpeg
     startCommand: python3 webhook_server.py
     plan: free
     envVars:
