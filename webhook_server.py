@@ -12,6 +12,7 @@ Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có ngư�
 - /help xem hướng dẫn, /thongke xem số link đã tải.
 - Huy (admin) nhắn câu hỏi -> bot trả lời như Muse qua AI (Groq).
 - Lưu id mọi người dùng nhắn bot vào users.json (để gửi thông báo hàng loạt).
+- Ghi lại số lượt tải + nền tảng của từng người dùng (admin xem trong /danhsach).
 - Huy nhắn /thongbao <nội dung> để gửi thông báo tới toàn bộ người dùng đã lưu.
 - Người lạ nhắn chữ không phải link -> chỉ hướng dẫn gửi link.
 
@@ -97,6 +98,40 @@ def register_user(chat_id, user=None):
                 u["username"] = user.get("username")
             if user.get("first_name"):
                 u["first_name"] = user.get("first_name")
+        USERS[key] = u
+        try:
+            save_users(USERS)
+        except Exception as e:  # noqa: BLE001 - lưu lỗi thì lần sau ghi lại
+            log(f"Lưu users.json lỗi: {e}")
+
+
+def fmt_ago(ts):
+    """'vừa xong', '5 phút trước', '2 giờ trước', '3 ngày trước'."""
+    try:
+        delta = int(time.time()) - int(ts)
+    except (TypeError, ValueError):
+        return "không rõ"
+    if delta < 60:
+        return "vừa xong"
+    if delta < 3600:
+        return f"{delta // 60} phút trước"
+    if delta < 86400:
+        return f"{delta // 3600} giờ trước"
+    return f"{delta // 86400} ngày trước"
+
+
+def record_download(chat_id, platform):
+    """Ghi lại hoạt động tải video của người dùng (để admin xem trong /danhsach)."""
+    if not chat_id or chat_id <= 0:
+        return
+    key = str(chat_id)
+    now = int(time.time())
+    with LOCK:
+        u = USERS.get(key) or {"first_seen": now}
+        u["downloads"] = int(u.get("downloads") or 0) + 1
+        u["last_platform"] = platform
+        u["last_download"] = now
+        u["last_seen"] = now
         USERS[key] = u
         try:
             save_users(USERS)
@@ -709,6 +744,7 @@ def handle_generic(chat_id, url, platform):
         except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn video
             log(f"Gửi nhạc lỗi: {e}")
     bump_stat(platform)
+    record_download(chat_id, platform)
     send_done(chat_id, sent, url)
 
 
@@ -828,6 +864,7 @@ def handle_tiktok(chat_id, url):
             sent = set()
         if sent:
             bump_stat("TikTok")
+            record_download(chat_id, "TikTok")
             send_done(chat_id, sent, url)
             return
         log("TikWM có dữ liệu nhưng không gửi được, chuyển sang yt-dlp")
@@ -840,6 +877,7 @@ def handle_tiktok(chat_id, url):
                       "(Link vẫn công khai, do server tải đang bận.)")
         return
     bump_stat("TikTok")
+    record_download(chat_id, "TikTok")
     send_done(chat_id, sent, url)
 
 
@@ -905,11 +943,9 @@ def handle_update(update):
         with LOCK:
             total = STATS["total"]
             parts = dict(STATS["platforms"])
-            n_users = len(USERS)
         lines = [f"📊 Bot đã tải {total} link."]
         for name, n in sorted(parts.items(), key=lambda kv: -kv[1]):
             lines.append(f"• {name}: {n}")
-        lines.append(f"👥 {n_users} người dùng đã lưu.")
         lines.append("(Số liệu từ lúc server chạy lại.)")
         send(chat_id, "\n".join(lines))
         return
@@ -934,7 +970,14 @@ def handle_update(update):
             name = f"@{v['username']}" if v.get("username") else k
             if v.get("blocked"):
                 name += " (đã chặn bot)"
-            lines.append(f"• {name}")
+            n = int(v.get("downloads") or 0)
+            plat = v.get("last_platform") or ""
+            last = fmt_ago(v.get("last_seen") or 0)
+            if n:
+                lines.append(f"• {name} — {n} lượt tải ({plat}), "
+                             f"hoạt động {last}")
+            else:
+                lines.append(f"• {name} — chưa tải gì, hoạt động {last}")
         if len(items) > 20:
             lines.append(f"... và {len(items) - 20} người nữa.")
         send(chat_id, "\n".join(lines))

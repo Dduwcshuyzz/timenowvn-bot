@@ -8,7 +8,9 @@ nhạc, tải bản thường (480p), mở link gốc. Nhắn "nhac" để gửi
 của link vừa tải. /help xem hướng dẫn, /thongke xem số link đã tải.
 Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tự lưu id mọi người dùng nhắn
 bot vào users.json; Huy nhắn /thongbao <nội dung> để gửi thông báo tới toàn
-bộ người dùng đã lưu, /danhsach xem số người dùng đã lưu. Bot tải TikTok qua API TikWM
+bộ người dùng đã lưu, /danhsach xem số người dùng đã lưu (chỉ admin xem được,
+kèm số lượt tải và thời gian hoạt động của từng người; người dùng thường gõ
+/thongbao hay /danhsach đều bị chặn). Bot tải TikTok qua API TikWM
 trước; nếu TikWM chặn IP server (đã gặp trên Render, lỗi 403) thì tự chuyển
 sang yt-dlp (video), nếu yt-dlp cũng bị TikTok chặn thì lấy link video từ
 HTML trang TikTok (playAddr). YouTube / Instagram / Facebook / X tải bằng
