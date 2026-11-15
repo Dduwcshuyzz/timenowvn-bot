@@ -6,7 +6,9 @@ cái đó (bài đăng ảnh TikTok thì gửi từng ảnh + nhạc). Gửi nhi
 1 tin nhắn (tối đa 3) để tải hàng loạt. Sau khi tải xong có nút bấm: lấy lại
 nhạc, tải bản thường (480p), mở link gốc. Nhắn "nhac" để gửi lại file nhạc
 của link vừa tải. /help xem hướng dẫn, /thongke xem số link đã tải.
-Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tải TikTok qua API TikWM
+Huy nhắn câu hỏi thì bot trả lời như Muse. Bot tự lưu id mọi người dùng nhắn
+bot vào users.json; Huy nhắn /thongbao <nội dung> để gửi thông báo tới toàn
+bộ người dùng đã lưu, /danhsach xem số người dùng đã lưu. Bot tải TikTok qua API TikWM
 trước; nếu TikWM chặn IP server (đã gặp trên Render, lỗi 403) thì tự chuyển
 sang yt-dlp (video), nếu yt-dlp cũng bị TikTok chặn thì lấy link video từ
 HTML trang TikTok (playAddr). YouTube / Instagram / Facebook / X tải bằng

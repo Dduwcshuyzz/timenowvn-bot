@@ -11,6 +11,8 @@ Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có ngư�
 - Nhắn "nhac" sau khi tải video -> bot gửi lại file nhạc MP3.
 - /help xem hướng dẫn, /thongke xem số link đã tải.
 - Huy (admin) nhắn câu hỏi -> bot trả lời như Muse qua AI (Groq).
+- Lưu id mọi người dùng nhắn bot vào users.json (để gửi thông báo hàng loạt).
+- Huy nhắn /thongbao <nội dung> để gửi thông báo tới toàn bộ người dùng đã lưu.
 - Người lạ nhắn chữ không phải link -> chỉ hướng dẫn gửi link.
 
 Chạy:  python3 webhook_server.py   (mặc định cổng 8080)
@@ -54,6 +56,52 @@ LAST_MUSIC = {}
 LAST_DOWNLOAD = {}
 # Thống kê trong bộ nhớ (reset khi server chạy lại).
 STATS = {"total": 0, "platforms": {}}
+
+# Danh sách người dùng đã nhắn bot (chat riêng), lưu vào users.json để
+# gửi thông báo hàng loạt. File lưu trên ổ đĩa server (Render Free mất file
+# khi deploy/khởi động lại thì danh sách tự ghi lại khi người dùng nhắn tiếp).
+USERS_FILE = os.path.join(BASE, "users.json")
+
+
+def load_users():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_users(users):
+    tmp = USERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, USERS_FILE)
+
+
+USERS = load_users()
+
+
+def register_user(chat_id, user=None):
+    """Lưu id người dùng khi họ nhắn bot (để sau này gửi thông báo hàng loạt).
+    Chỉ lưu chat riêng (id > 0); nhóm/kênh không lưu."""
+    if not chat_id or chat_id <= 0:
+        return
+    key = str(chat_id)
+    now = int(time.time())
+    with LOCK:
+        u = USERS.get(key) or {"first_seen": now}
+        u["last_seen"] = now
+        if user:
+            if user.get("username"):
+                u["username"] = user.get("username")
+            if user.get("first_name"):
+                u["first_name"] = user.get("first_name")
+        USERS[key] = u
+        try:
+            save_users(USERS)
+        except Exception as e:  # noqa: BLE001 - lưu lỗi thì lần sau ghi lại
+            log(f"Lưu users.json lỗi: {e}")
 
 
 def bump_stat(platform):
@@ -694,6 +742,40 @@ def send_done(chat_id, sent, orig_url):
     send_markup(chat_id, text, kb)
 
 
+def handle_broadcast(admin_id, text):
+    """Gửi thông báo tới toàn bộ người dùng đã lưu (trừ admin).
+    Người chặn bot (403) được đánh dấu để lần sau bỏ qua."""
+    content = text.strip()
+    if not content:
+        send(admin_id, "Huy gõ: /thongbao <nội dung> — ví dụ:\n"
+                       "/thongbao Bot vừa có tính năng mới, thử ngay nhé!")
+        return
+    with LOCK:
+        targets = [int(k) for k, v in USERS.items()
+                   if int(k) != admin_id and not v.get("blocked")]
+    ok = fail = 0
+    for cid in targets:
+        try:
+            send(cid, content)
+            ok += 1
+        except Exception as e:  # noqa: BLE001 - lỗi từng người thì đếm, không dừng
+            fail += 1
+            log(f"Gửi thông báo tới {cid} lỗi: {e}")
+            if "403" in str(e) or "blocked" in str(e).lower():
+                with LOCK:
+                    if str(cid) in USERS:
+                        USERS[str(cid)]["blocked"] = True
+                        try:
+                            save_users(USERS)
+                        except Exception:
+                            pass
+        time.sleep(0.05)
+    msg = f"📣 Đã gửi thông báo tới {ok}/{len(targets)} người dùng."
+    if fail:
+        msg += f" {fail} người gửi lỗi (có thể đã chặn bot)."
+    send(admin_id, msg)
+
+
 def handle_callback(chat_id, data):
     """Xử lý nút bấm dưới tin 'Xong rồi'."""
     dl = LAST_DOWNLOAD.get(chat_id) or {}
@@ -767,6 +849,7 @@ def handle_update(update):
     if cq:
         chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id")
         if chat_id:
+            register_user(chat_id, cq.get("from"))
             try:
                 tg("answerCallbackQuery", {"callback_query_id": cq.get("id")})
             except Exception:  # noqa: BLE001 - bấm nút vẫn chạy tiếp
@@ -779,6 +862,7 @@ def handle_update(update):
     chat_id = chat.get("id")
     if not chat_id:
         return
+    register_user(chat_id, msg.get("from"))
     username = (msg.get("from") or {}).get("username", "")
     text = (msg.get("text") or "").strip()
     low = text.lower()
@@ -793,7 +877,9 @@ def handle_update(update):
                 "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải\n"
                 "ℹ️ /help xem hướng dẫn, /thongke xem số link đã tải")
         if chat_id == ADMIN_CHAT_ID:
-            card += "\n\nHuy cứ nhắn câu hỏi, mình trả lời như Muse nhé."
+            card += ("\n\nHuy cứ nhắn câu hỏi, mình trả lời như Muse nhé."
+                     "\n📣 /thongbao <nội dung> gửi thông báo tới toàn bộ "
+                     "người dùng, /danhsach xem số người dùng đã lưu.")
         send(chat_id, card)
         return
 
@@ -819,10 +905,38 @@ def handle_update(update):
         with LOCK:
             total = STATS["total"]
             parts = dict(STATS["platforms"])
+            n_users = len(USERS)
         lines = [f"📊 Bot đã tải {total} link."]
         for name, n in sorted(parts.items(), key=lambda kv: -kv[1]):
             lines.append(f"• {name}: {n}")
+        lines.append(f"👥 {n_users} người dùng đã lưu.")
         lines.append("(Số liệu từ lúc server chạy lại.)")
+        send(chat_id, "\n".join(lines))
+        return
+
+    # ---- /thongbao (chỉ Huy): gửi thông báo tới toàn bộ người dùng ----
+    if low.startswith("/thongbao"):
+        if chat_id != ADMIN_CHAT_ID:
+            send(chat_id, "Lệnh này chỉ admin dùng được nhé.")
+            return
+        handle_broadcast(chat_id, text[len("/thongbao"):])
+        return
+
+    # ---- /danhsach (chỉ Huy): xem số người dùng đã lưu ----
+    if low.startswith("/danhsach"):
+        if chat_id != ADMIN_CHAT_ID:
+            send(chat_id, "Lệnh này chỉ admin dùng được nhé.")
+            return
+        with LOCK:
+            items = list(USERS.items())
+        lines = [f"👥 Bot đã lưu {len(items)} người dùng."]
+        for k, v in items[:20]:
+            name = f"@{v['username']}" if v.get("username") else k
+            if v.get("blocked"):
+                name += " (đã chặn bot)"
+            lines.append(f"• {name}")
+        if len(items) > 20:
+            lines.append(f"... và {len(items) - 20} người nữa.")
         send(chat_id, "\n".join(lines))
         return
 
