@@ -13,8 +13,14 @@ Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có ngư�
 - Huy (admin) nhắn câu hỏi -> bot trả lời như Muse qua AI (Groq).
 - Lưu id mọi người dùng nhắn bot vào users.json (để gửi thông báo hàng loạt).
 - Ghi lại số lượt tải + nền tảng của từng người dùng (admin xem trong /danhsach).
+- Mỗi khi có người tải xong, bot nhắn báo ngay cho Huy (admin) kèm tên
+  người tải, nền tảng và link (không báo khi chính Huy tải).
 - Huy nhắn /thongbao <nội dung> để gửi thông báo tới toàn bộ người dùng đã lưu.
 - Người lạ nhắn chữ không phải link -> chỉ hướng dẫn gửi link.
+- Gặp sự cố khi tải -> tin báo lỗi kèm nút "🆘 Cần hỗ trợ": bấm nút là
+  bot gửi yêu cầu hỗ trợ tới Huy (admin) kèm link lỗi, tin nhắn tiếp theo
+  của người dùng được chuyển tiếp cho admin; admin trả lời bằng
+  /traloi <chat_id> <nội dung>. /hotro mở hỗ trợ bất cứ lúc nào.
 
 Chạy:  python3 webhook_server.py   (mặc định cổng 8080)
 Biến môi trường bắt buộc:
@@ -55,6 +61,12 @@ LOCK = threading.Lock()
 LAST_MUSIC = {}
 # Thông tin link vừa tải xong, theo chat_id — để nút bấm lấy lại nhạc / bản thường.
 LAST_DOWNLOAD = {}
+# Link lỗi của lần tải gần nhất, theo chat_id — để nút "Cần hỗ trợ" biết
+# gửi link nào cho admin.
+LAST_FAILED = {}
+# Người dùng đã bấm "Cần hỗ trợ" và đang chờ mô tả thêm: tin nhắn chữ
+# tiếp theo của họ được chuyển tiếp cho admin.
+SUPPORT_PENDING = {}
 # Thống kê trong bộ nhớ (reset khi server chạy lại).
 STATS = {"total": 0, "platforms": {}}
 
@@ -158,6 +170,8 @@ SYSTEM_PROMPT = (
 )
 
 TIKWM_API = "https://www.tikwm.com/api/?url="
+# Host dự phòng của TikWM (cùng API, khác host).
+TIKWM_API_ALT = "https://tikwm.com/api/?url="
 URL_RE = re.compile(r"https?://\S+")
 TIKTOK_HOSTS = ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com")
 # Nền tảng tải bằng yt-dlp (đã kiểm chứng YouTube, Instagram trên máy;
@@ -202,6 +216,34 @@ def send(chat_id, text):
 def send_markup(chat_id, text, markup):
     tg("sendMessage", {"chat_id": chat_id, "text": text[:4000],
                        "reply_markup": markup})
+
+
+SUPPORT_BUTTON = {"inline_keyboard": [
+    [{"text": "🆘 Cần hỗ trợ", "callback_data": "support"}]]}
+
+
+def notify_admin_download(chat_id, platform, url):
+    """Báo cho Huy mỗi khi có người tải xong (không báo khi chính Huy tải)."""
+    if chat_id == ADMIN_CHAT_ID:
+        return
+    user = (USERS.get(str(chat_id)) or {})
+    who = f"@{user['username']}" if user.get("username") else str(chat_id)
+    if user.get("first_name"):
+        who += f" ({user['first_name']})"
+    try:
+        send(ADMIN_CHAT_ID, f"📥 {who} vừa tải {platform}\n🔗 {url}")
+    except Exception as e:  # noqa: BLE001 - báo admin lỗi thì vẫn tải bình thường
+        log(f"Báo admin lượt tải lỗi: {e}")
+
+
+def send_error(chat_id, text, failed_url=None, platform=None):
+    """Tin báo lỗi kèm nút hỗ trợ: bấm nút là bot báo cho admin kèm link lỗi.
+    Lưu link lỗi lại để callback 'support' biết gửi link nào."""
+    if failed_url:
+        with LOCK:
+            LAST_FAILED[chat_id] = {"url": failed_url,
+                                    "platform": platform or ""}
+    send_markup(chat_id, text, SUPPORT_BUTTON)
 
 
 def send_video(chat_id, video_url, caption=""):
@@ -315,14 +357,18 @@ def call_ai(user_text):
 
 
 def fetch_tikwm(url):
-    """Gọi API TikWM, thử lại tối đa 2 lần. Trả dict data hoặc raise."""
-    api_url = TIKWM_API + urllib.parse.quote(url, safe="")
+    """Gọi API TikWM, thử lại tối đa 3 lần, đổi host www <-> không www.
+    TikWM hay giới hạn theo IP (403) khi gọi dồn dập vì IP server dùng
+    chung cho mọi người dùng bot, nên thử lại với chờ lâu dần.
+    Trả dict data hoặc raise."""
+    hosts = (TIKWM_API, TIKWM_API_ALT)
     last_err = None
-    for i in range(2):
+    for i in range(3):
+        api_url = hosts[i % len(hosts)] + urllib.parse.quote(url, safe="")
         try:
             req = urllib.request.Request(api_url, headers={
                 "User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=12) as r:
+            with urllib.request.urlopen(req, timeout=25) as r:
                 data = json.load(r)
             if data.get("code") == 0 and data.get("data"):
                 return data["data"]
@@ -330,7 +376,7 @@ def fetch_tikwm(url):
         except Exception as e:  # noqa: BLE001 - thử lại / fallback sau
             last_err = e
         log(f"TikWM lần {i + 1} lỗi: {last_err}")
-        time.sleep(1)
+        time.sleep(2 * (i + 1))
     raise RuntimeError(f"TikWM lỗi: {last_err}")
 
 
@@ -510,6 +556,104 @@ def fmt_num(n):
     return str(n)
 
 
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36")
+# Giới hạn gửi file của Telegram Bot API.
+MAX_VIDEO_BYTES = 45_000_000
+
+
+def download_video_file(url, max_bytes=120_000_000):
+    """Tải file video về thư mục tạm, trả (đường dẫn file, thư mục tạm).
+    CDN TikTok chặn request không có UA trình duyệt + Referer (403) nên
+    phải giả trình duyệt. Raise nếu lỗi hoặc file quá max_bytes."""
+    tmpdir = tempfile.mkdtemp(prefix="timenow_vid_")
+    path = os.path.join(tmpdir, "video.mp4")
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": BROWSER_UA, "Referer": "https://www.tiktok.com/"})
+        total = 0
+        with urllib.request.urlopen(req, timeout=180) as r, \
+                open(path, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("Video nặng hơn giới hạn tải")
+                f.write(chunk)
+        if total == 0:
+            raise RuntimeError("file video rỗng")
+        return path, tmpdir
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+
+def reencode_fit(path, tmpdir, duration=0):
+    """Nén lại video bằng ffmpeg để vừa giới hạn 45MB của Telegram.
+    Tính bitrate từ thời lượng (giữ 90% giới hạn cho an toàn); thử 720p
+    rồi 480p. Trả đường dẫn file vừa giới hạn (file gốc nếu đã vừa).
+    Raise nếu vẫn quá nặng hoặc không có ffmpeg."""
+    if os.path.getsize(path) <= MAX_VIDEO_BYTES:
+        return path
+    ff = ffmpeg_exe()
+    if not ff:
+        raise RuntimeError("Video nặng hơn 45MB và không có ffmpeg để nén")
+    # Bitrate mục tiêu (kbps): tổng = video + nhạc.
+    if duration and duration > 0:
+        total_kbps = int(MAX_VIDEO_BYTES * 0.90 * 8 / duration / 1000)
+        audio_kbps = 96
+        video_kbps = max(200, total_kbps - audio_kbps)
+    else:
+        video_kbps = 1000
+        audio_kbps = 128
+    for height in (720, 480):
+        out = os.path.join(tmpdir, f"video_{height}p.mp4")
+        vb = video_kbps if height == 720 else max(200, video_kbps * 2 // 3)
+        cmd = [ff, "-y", "-i", path,
+               "-vf", f"scale=-2:min({height}\\,ih)",
+               "-c:v", "libx264", "-preset", "veryfast",
+               "-b:v", f"{vb}k", "-maxrate", f"{vb * 3 // 2}k",
+               "-bufsize", f"{vb * 3}k",
+               "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+               "-movflags", "+faststart", out]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if r.returncode == 0 and os.path.exists(out):
+            size = os.path.getsize(out)
+            if size <= MAX_VIDEO_BYTES:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return out
+            log(f"Nén {height}p vẫn nặng {size} byte")
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        else:
+            log(f"ffmpeg nén {height}p lỗi: {(r.stderr or '').strip()[-200:]}")
+    raise RuntimeError("Video vẫn nặng hơn 45MB sau khi nén")
+
+
+def upload_tiktok_video(chat_id, video_url, caption="", duration=0):
+    """Tải video TikTok về server rồi upload file lên Telegram.
+    Link CDN TikTok chặn cả Telegram tải trực tiếp (403 khi không có UA
+    trình duyệt) nên phải tải qua server. File nặng hơn 45MB thì nén lại.
+    Raise nếu vẫn lỗi — caller tự fallback sang gửi link."""
+    tmpdir = None
+    try:
+        path, tmpdir = download_video_file(video_url)
+        path = reencode_fit(path, tmpdir, duration)
+        tg_multipart_video(chat_id, path, "video.mp4", caption)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def send_from_tikwm(chat_id, data, url):
     """Gửi đủ ảnh bìa + video + nhạc từ dữ liệu TikWM.
     Trả tập hợp những gì đã gửi được: {"anh", "video", "nhac"}."""
@@ -559,14 +703,20 @@ def send_from_tikwm(chat_id, data, url):
                 sent.add("anh")
             except Exception as e:  # noqa: BLE001 - bìa lỗi thì vẫn gửi video
                 log(f"Gửi ảnh bìa lỗi: {e}")
-        size = int(data.get("size") or 0)
-        if size > 45_000_000:
-            send(chat_id, "Video nặng hơn 45MB nên bot không gửi file được, "
-                          f"Huy bấm link này để tải: {play}")
-        else:
+        # Tải file về server rồi upload lại: link CDN TikTok chặn request
+        # không có UA trình duyệt (403), Telegram cũng không tải được link
+        # đó nên gửi bằng link hay lỗi. File nặng hơn 45MB thì nén lại.
+        video_sent = False
+        try:
+            upload_tiktok_video(chat_id, play,
+                                "" if "anh" in sent else caption, dur)
+            video_sent = True
+        except Exception as e:  # noqa: BLE001 - dự phòng: gửi bằng link
+            log(f"Tải/upload video TikWM lỗi: {e}")
+        if not video_sent:
             try:
                 send_video(chat_id, play, "" if "anh" in sent else caption)
-            except Exception:  # noqa: BLE001 - thử lại bằng link thường
+            except Exception:  # noqa: BLE001 - gửi link trực tiếp
                 send(chat_id, "Gửi video lỗi, thử lại bằng link tải trực tiếp:\n"
                               f"{play}")
         sent.add("video")
@@ -692,8 +842,9 @@ def handle_generic(chat_id, url, platform):
         info = ytdlp_info(url)
     except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
         log(f"yt-dlp {platform} thất bại: {e}")
-        send(chat_id, f"Không tải được link {platform} này, thử lại sau vài phút nhé. "
-                      "(Chỉ tải được video công khai.)")
+        send_error(chat_id, f"Không tải được link {platform} này, thử lại sau "
+                            "vài phút nhé. (Chỉ tải được video công khai.)",
+                   failed_url=url, platform=platform)
         return
     title = (info.get("title") or "").strip()
     uploader = info.get("uploader") or ""
@@ -719,8 +870,9 @@ def handle_generic(chat_id, url, platform):
             path, tmpdir = download_merged(url, 480)
         except Exception as e2:  # noqa: BLE001 - báo lỗi gọn cho người dùng
             log(f"Tải {platform} 480p lỗi: {e2}")
-            send(chat_id, f"Không tải được video {platform} này (nặng quá hoặc "
-                          "link lỗi), thử link khác nhé.")
+            send_error(chat_id, f"Không tải được video {platform} này (nặng quá "
+                                "hoặc link lỗi), thử link khác nhé.",
+                       failed_url=url, platform=platform)
             return
     try:
         tg_multipart_video(chat_id, path, "video.mp4",
@@ -728,7 +880,8 @@ def handle_generic(chat_id, url, platform):
         sent.add("video")
     except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
         log(f"Upload video {platform} lỗi: {e}")
-        send(chat_id, f"Gửi video {platform} lỗi, thử lại sau nhé.")
+        send_error(chat_id, f"Gửi video {platform} lỗi, thử lại sau nhé.",
+                   failed_url=url, platform=platform)
         return
     finally:
         if tmpdir:
@@ -745,6 +898,7 @@ def handle_generic(chat_id, url, platform):
             log(f"Gửi nhạc lỗi: {e}")
     bump_stat(platform)
     record_download(chat_id, platform)
+    notify_admin_download(chat_id, platform, url)
     send_done(chat_id, sent, url)
 
 
@@ -813,7 +967,32 @@ def handle_broadcast(admin_id, text):
 
 
 def handle_callback(chat_id, data):
-    """Xử lý nút bấm dưới tin 'Xong rồi'."""
+    """Xử lý nút bấm dưới tin 'Xong rồi' và nút 'Cần hỗ trợ'."""
+    if data == "support":
+        # Gửi yêu cầu hỗ trợ tới admin kèm link lỗi (nếu có), rồi chờ người
+        # dùng mô tả thêm ở tin nhắn tiếp theo để chuyển tiếp luôn.
+        with LOCK:
+            failed = LAST_FAILED.get(chat_id) or {}
+            SUPPORT_PENDING[chat_id] = failed
+        user = (USERS.get(str(chat_id)) or {})
+        who = f"@{user['username']}" if user.get("username") else str(chat_id)
+        if user.get("first_name"):
+            who += f" ({user['first_name']})"
+        ticket = (f"🆘 Yêu cầu hỗ trợ từ {who} (chat_id {chat_id})")
+        if failed.get("url"):
+            ticket += f"\n🔗 Link lỗi: {failed['url']}"
+            if failed.get("platform"):
+                ticket += f" ({failed['platform']})"
+        ticket += ("\n\nTrả lời người này bằng:\n"
+                   f"/traloi {chat_id} <nội dung>")
+        try:
+            send(ADMIN_CHAT_ID, ticket)
+        except Exception as e:  # noqa: BLE001 - báo admin lỗi thì vẫn báo user
+            log(f"Gửi yêu cầu hỗ trợ tới admin lỗi: {e}")
+        send(chat_id, "Đã báo cho admin rồi nhé, bạn chờ chút nha. "
+                      "Bạn mô tả thêm lỗi gặp phải ở tin nhắn tiếp theo, "
+                      "mình chuyển tiếp luôn cho admin.")
+        return
     dl = LAST_DOWNLOAD.get(chat_id) or {}
     if data == "dl:music":
         music = dl.get("music")
@@ -827,7 +1006,18 @@ def handle_callback(chat_id, data):
     elif data == "dl:sd":
         sd = dl.get("sd")
         if sd:
-            send_video(chat_id, sd, "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
+            if dl.get("platform") == "TikTok":
+                # Link CDN TikTok hay chặn Telegram tải trực tiếp (403),
+                # tải về server rồi upload lại, nén nếu nặng hơn 45MB.
+                try:
+                    upload_tiktok_video(
+                        chat_id, sd, "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
+                except Exception as e:  # noqa: BLE001 - gửi bằng link như trước
+                    log(f"Tải bản thường TikTok lỗi: {e}")
+                    send_video(chat_id, sd,
+                               "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
+            else:
+                send_video(chat_id, sd, "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
         elif dl.get("platform") in ("YouTube", "Instagram", "Facebook", "X") \
                 and dl.get("orig"):
             send(chat_id, "⏳ Đang tải bản thường, chờ mình chút nhé...")
@@ -865,6 +1055,7 @@ def handle_tiktok(chat_id, url):
         if sent:
             bump_stat("TikTok")
             record_download(chat_id, "TikTok")
+            notify_admin_download(chat_id, "TikTok", url)
             send_done(chat_id, sent, url)
             return
         log("TikWM có dữ liệu nhưng không gửi được, chuyển sang yt-dlp")
@@ -873,11 +1064,13 @@ def handle_tiktok(chat_id, url):
         sent = handle_with_ytdlp(chat_id, url)
     except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
         log(f"yt-dlp thất bại: {e}")
-        send(chat_id, "Không tải được link này, thử lại sau vài phút nhé. "
-                      "(Link vẫn công khai, do server tải đang bận.)")
+        send_error(chat_id, "Không tải được link này, thử lại sau vài phút nhé. "
+                            "(Link vẫn công khai, do server tải đang bận.)",
+                   failed_url=url, platform="TikTok")
         return
     bump_stat("TikTok")
     record_download(chat_id, "TikTok")
+    notify_admin_download(chat_id, "TikTok", url)
     send_done(chat_id, sent, url)
 
 
@@ -913,6 +1106,7 @@ def handle_update(update):
                 "📱 Tải được: TikTok, YouTube, Instagram, Facebook, X\n"
                 "📎 Gửi nhiều link trong 1 tin nhắn (tối đa 3) để tải hàng loạt\n"
                 "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải\n"
+                "🆘 Gặp sự cố thì bấm nút 'Cần hỗ trợ' hoặc gõ /hotro\n"
                 "ℹ️ /help xem hướng dẫn, /thongke xem số link đã tải")
         if chat_id == ADMIN_CHAT_ID:
             card += ("\n\nHuy cứ nhắn câu hỏi, mình trả lời như Muse nhé."
@@ -934,8 +1128,22 @@ def handle_update(update):
              "• Tải bản thường (nhẹ hơn, nhanh hơn)\n"
              "• Mở link gốc\n\n"
              "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải.\n"
-             "📊 /thongke xem số link bot đã tải.\n\n"
+             "📊 /thongke xem số link bot đã tải.\n"
+             "🆘 Gặp sự cố khi tải: bấm nút 'Cần hỗ trợ' dưới tin báo lỗi, "
+             "hoặc gõ /hotro để nhờ admin giúp.\n\n"
              "Chỉ tải được nội dung công khai thôi nhé.")
+        return
+
+    # ---- /hotro ----
+    if low.startswith("/hotro"):
+        with LOCK:
+            SUPPORT_PENDING[chat_id] = LAST_FAILED.get(chat_id) or {}
+        send_markup(chat_id,
+                    "🆘 Cần hỗ trợ à? Bạn mô tả lỗi gặp phải ở tin nhắn tiếp "
+                    "theo nhé, mình chuyển tiếp luôn cho admin.\n\n"
+                    "Nhớ kèm link video bị lỗi (nếu có) để admin kiểm tra "
+                    "nhanh hơn.",
+                    SUPPORT_BUTTON)
         return
 
     # ---- /thongke ----
@@ -983,6 +1191,29 @@ def handle_update(update):
         send(chat_id, "\n".join(lines))
         return
 
+    # ---- /traloi (chỉ Huy): trả lời người dùng đang cần hỗ trợ ----
+    if low.startswith("/traloi"):
+        if chat_id != ADMIN_CHAT_ID:
+            send(chat_id, "Lệnh này chỉ admin dùng được nhé.")
+            return
+        parts = text.split(None, 2)
+        if len(parts) < 3:
+            send(chat_id, "Huy gõ: /traloi <chat_id> <nội dung> — ví dụ:\n"
+                          "/traloi 123456789 Link này tải được rồi, bạn thử lại nhé!")
+            return
+        try:
+            target = int(parts[1])
+        except ValueError:
+            send(chat_id, "chat_id phải là số nhé, Huy kiểm tra lại.")
+            return
+        try:
+            send(target, f"💬 Admin TimeNow trả lời bạn:\n{parts[2]}")
+            send(chat_id, f"Đã gửi trả lời tới {target}.")
+        except Exception as e:  # noqa: BLE001 - người dùng chặn bot thì báo lại
+            log(f"Trả lời hỗ trợ tới {target} lỗi: {e}")
+            send(chat_id, f"Gửi tới {target} lỗi, có thể người này đã chặn bot.")
+        return
+
     # ---- Lấy nhạc MP3 của video vừa tải ----
     if low in ("nhac", "mp3", "🎵", "nhạc"):
         with LOCK:
@@ -1012,6 +1243,30 @@ def handle_update(update):
                 send(chat_id, "Link này bot chưa tải được, hiện tải được "
                               "TikTok, YouTube, Instagram, Facebook, X nhé.")
         return
+
+    # ---- Người dùng đang cần hỗ trợ: chuyển tiếp tin nhắn cho admin ----
+    # (Chỉ áp dụng với người thường, không áp dụng với Huy vì Huy chat với
+    # bot là để hỏi AI; và chỉ chuyển tin chữ, link thì vẫn đi luồng tải.)
+    if chat_id != ADMIN_CHAT_ID and text and not urls:
+        with LOCK:
+            pending = SUPPORT_PENDING.pop(chat_id, None)
+        if pending is not None:
+            user = (USERS.get(str(chat_id)) or {})
+            who = f"@{user['username']}" if user.get("username") else str(chat_id)
+            if user.get("first_name"):
+                who += f" ({user['first_name']})"
+            fwd = (f"🆘 {who} (chat_id {chat_id}) mô tả thêm:\n{text}")
+            if pending.get("url"):
+                fwd += f"\n🔗 Link lỗi: {pending['url']}"
+            fwd += (f"\n\nTrả lời bằng:\n/traloi {chat_id} <nội dung>")
+            try:
+                send(ADMIN_CHAT_ID, fwd)
+                send(chat_id, "Đã chuyển mô tả của bạn cho admin rồi, "
+                              "bạn chờ admin trả lời nhé.")
+            except Exception as e:  # noqa: BLE001 - gửi admin lỗi thì báo lại
+                log(f"Chuyển tiếp hỗ trợ lỗi: {e}")
+                send(chat_id, "Gửi cho admin lỗi, bạn thử lại sau nhé.")
+            return
 
     # ---- Hỏi đáp Muse (chỉ Huy) ----
     if chat_id == ADMIN_CHAT_ID and text:
