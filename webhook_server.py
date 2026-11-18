@@ -21,6 +21,8 @@ Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có ngư�
   bot gửi yêu cầu hỗ trợ tới Huy (admin) kèm link lỗi, tin nhắn tiếp theo
   của người dùng được chuyển tiếp cho admin; admin trả lời bằng
   /traloi <chat_id> <nội dung>. /hotro mở hỗ trợ bất cứ lúc nào.
+- Chỉ báo video đã gửi khi thực sự gửi được; TikWM gửi video lỗi thì
+  tự thử yt-dlp tải file rồi upload lên Telegram.
 
 Chạy:  python3 webhook_server.py   (mặc định cổng 8080)
 Biến môi trường bắt buộc:
@@ -706,6 +708,8 @@ def send_from_tikwm(chat_id, data, url):
         # Tải file về server rồi upload lại: link CDN TikTok chặn request
         # không có UA trình duyệt (403), Telegram cũng không tải được link
         # đó nên gửi bằng link hay lỗi. File nặng hơn 45MB thì nén lại.
+        # Chỉ ghi nhận đã gửi video khi thực sự gửi được — nếu cả 2 cách
+        # đều lỗi thì để caller thử cách khác (yt-dlp), đừng báo xong giả.
         video_sent = False
         try:
             upload_tiktok_video(chat_id, play,
@@ -716,10 +720,12 @@ def send_from_tikwm(chat_id, data, url):
         if not video_sent:
             try:
                 send_video(chat_id, play, "" if "anh" in sent else caption)
+                video_sent = True
             except Exception:  # noqa: BLE001 - gửi link trực tiếp
                 send(chat_id, "Gửi video lỗi, thử lại bằng link tải trực tiếp:\n"
                               f"{play}")
-        sent.add("video")
+        if video_sent:
+            sent.add("video")
         if data.get("music"):
             send_music(data["music"])
         hd = data.get("hdplay")
@@ -817,7 +823,37 @@ def handle_with_ytdlp(chat_id, url):
             sent.add("anh")
         except Exception as e:  # noqa: BLE001 - bìa lỗi thì vẫn gửi video
             log(f"Gửi ảnh bìa lỗi: {e}")
-    send_video(chat_id, video_url, "" if "anh" in sent else caption)
+    # Tải video bằng yt-dlp rồi upload file lên Telegram: link CDN TikTok
+    # hay chặn cả Telegram lẫn server tải trực tiếp, nên gửi bằng link
+    # thường lỗi. Hết cách thì raise để báo lỗi kèm nút hỗ trợ.
+    path = tmpdir = None
+    video_sent = False
+    try:
+        path, tmpdir = download_merged(url, 720)
+    except Exception as e:  # noqa: BLE001 - thử 480p
+        log(f"yt-dlp tải TikTok 720p lỗi: {e}, thử 480p")
+        try:
+            path, tmpdir = download_merged(url, 480)
+        except Exception as e2:  # noqa: BLE001 - báo lỗi gọn cho người dùng
+            log(f"yt-dlp tải TikTok 480p lỗi: {e2}")
+    if path:
+        try:
+            tg_multipart_video(chat_id, path, "video.mp4",
+                               "" if "anh" in sent else caption)
+            video_sent = True
+        except Exception as e:  # noqa: BLE001 - thử gửi bằng link
+            log(f"Upload video TikTok lỗi: {e}")
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+    if not video_sent:
+        try:
+            send_video(chat_id, video_url, "" if "anh" in sent else caption)
+            video_sent = True
+        except Exception as e:  # noqa: BLE001 - hết cách thì báo lỗi
+            log(f"Gửi video TikTok bằng link lỗi: {e}")
+    if not video_sent:
+        raise RuntimeError("không gửi được video TikTok")
     sent.add("video")
     audio = best_audio_url(info)
     sd = smallest_video_url(info)
@@ -1052,13 +1088,16 @@ def handle_tiktok(chat_id, url):
         except Exception as e:  # noqa: BLE001 - fallback sang yt-dlp
             log(f"Gửi từ TikWM lỗi, chuyển sang yt-dlp: {e}")
             sent = set()
-        if sent:
+        # Bài đăng ảnh: gửi được ảnh là đủ. Video: phải gửi được video
+        # thì mới xong — TikWM chỉ gửi được nhạc/bìa thì thử yt-dlp.
+        is_photo = bool(data.get("images"))
+        if "video" in sent or (is_photo and "anh" in sent):
             bump_stat("TikTok")
             record_download(chat_id, "TikTok")
             notify_admin_download(chat_id, "TikTok", url)
             send_done(chat_id, sent, url)
             return
-        log("TikWM có dữ liệu nhưng không gửi được, chuyển sang yt-dlp")
+        log("TikWM không gửi được video, chuyển sang yt-dlp")
     # Cách 2: yt-dlp / đọc HTML trang.
     try:
         sent = handle_with_ytdlp(chat_id, url)
