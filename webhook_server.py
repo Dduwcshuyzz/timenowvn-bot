@@ -4,8 +4,10 @@
 Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có người nhắn
 (webhook), server xử lý ngay tại chỗ, trả lời trong vài giây.
 
-- Gửi link TikTok / YouTube / Instagram / Facebook / X vào bot -> bot
-  gửi đủ ảnh bìa, video không logo và nhạc MP3 một lần.
+- Gửi link TikTok / Douyin / YouTube / Instagram / Facebook / X vào bot
+  -> bot gửi đủ ảnh bìa, video không logo và nhạc MP3 một lần.
+  Douyin (v12) đọc trang chia sẻ iesdouyin (SSR) bằng cookie khách
+  ttwid, không cần đăng nhập; nhạc MP3 tách từ file video bằng ffmpeg.
 - Gửi nhiều link trong 1 tin nhắn (tối đa 3) -> bot tải từng cái.
 - Sau khi tải xong có nút bấm: lấy lại nhạc, tải bản thường, mở link gốc.
 - Nhắn "nhac" sau khi tải video -> bot gửi lại file nhạc MP3.
@@ -38,6 +40,7 @@ Sau khi server chạy có địa chỉ https công khai, đặt webhook:
   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<địa-chỉ-của-bạn>/webhook"
 Xóa webhook (quay về polling): setWebhook?url=
 """
+import http.cookiejar
 import json
 import os
 import re
@@ -176,6 +179,7 @@ TIKWM_API = "https://www.tikwm.com/api/?url="
 TIKWM_API_ALT = "https://tikwm.com/api/?url="
 URL_RE = re.compile(r"https?://\S+")
 TIKTOK_HOSTS = ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com")
+DOUYIN_HOSTS = ("douyin.com", "iesdouyin.com")
 # Nền tảng tải bằng yt-dlp (đã kiểm chứng YouTube, Instagram trên máy;
 # Facebook, X dùng chung cách tải, link riêng tư/khóa thì không tải được).
 PLATFORM_HOSTS = {
@@ -189,6 +193,8 @@ PLATFORM_HOSTS = {
 def platform_of(host):
     if host.endswith(TIKTOK_HOSTS):
         return "TikTok"
+    if host.endswith(DOUYIN_HOSTS):
+        return "Douyin"
     for h, name in PLATFORM_HOSTS.items():
         if host == h or host.endswith("." + h):
             return name
@@ -870,6 +876,408 @@ def handle_with_ytdlp(chat_id, url):
     return sent
 
 
+# ---------------------------------------------------------------- Douyin
+# Tải Douyin bằng trang chia sẻ iesdouyin (SSR): trang đã render sẵn dữ
+# liệu video trong window._ROUTER_DATA nên không cần đăng nhập, không cần
+# chữ ký X-Bogus/A-Bogus như API web của douyin.com (API đó đòi cookie
+# tươi + chữ ký, yt-dlp cũng báo "Fresh cookies are needed").
+# Lần đọc đầu tiên chỉ để lấy cookie khách ttwid (Douyin tự cấp), lần
+# đọc sau mới có item_list. Giữ 1 cookie jar dùng chung để đỡ phải lấy
+# lại cookie mỗi link (trang chia sẻ dễ bị giới hạn theo IP nếu gọi dồn).
+DOUYIN_CJ = http.cookiejar.CookieJar()
+DOUYIN_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(DOUYIN_CJ))
+DOUYIN_REFERER = "https://www.douyin.com/"
+
+
+def _douyin_find_item(obj):
+    """Tìm item đầu tiên trong JSON _ROUTER_DATA (tìm đệ quy theo khóa
+    item_list, vì tên khóa trang video/note có thể khác nhau)."""
+    if isinstance(obj, dict):
+        items = obj.get("item_list")
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            return items[0]
+        for v in obj.values():
+            found = _douyin_find_item(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _douyin_find_item(v)
+            if found is not None:
+                return found
+    return None
+
+
+def _douyin_parse_router_data(html):
+    """Trích JSON window._ROUTER_DATA khỏi HTML trang chia sẻ."""
+    idx = html.find("window._ROUTER_DATA")
+    if idx < 0:
+        return None
+    brace = html.find("{", idx)
+    if brace < 0:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html[brace:])
+        return data
+    except Exception as e:  # noqa: BLE001 - caller thử lại / báo lỗi gọn
+        log(f"Đọc _ROUTER_DATA Douyin lỗi: {e}")
+        return None
+
+
+def resolve_douyin_id(url):
+    """Từ link Douyin (link ngắn v.douyin.com, link video/note, link có
+    modal_id) lấy (video_id, kind) với kind là 'video' hoặc 'note'."""
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    modal = (qs.get("modal_id") or [None])[0]
+    if modal and str(modal).isdigit():
+        return str(modal), "video"
+    m = re.search(r"/(video|note)/(\d+)", parsed.path or "")
+    if m:
+        return m.group(2), m.group(1)
+    # Link ngắn / link chia sẻ: đi theo redirect để lấy URL đầy đủ.
+    req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
+    with DOUYIN_OPENER.open(req, timeout=20) as r:
+        final = r.geturl()
+        r.read(1024)
+    fparsed = urllib.parse.urlparse(final)
+    fqs = urllib.parse.parse_qs(fparsed.query)
+    modal = (fqs.get("modal_id") or [None])[0]
+    if modal and str(modal).isdigit():
+        return str(modal), "video"
+    m = re.search(r"/(?:share/)?(video|note)/(\d+)", fparsed.path or "")
+    if m:
+        return m.group(2), m.group(1)
+    m = re.search(r"/(\d{15,25})(?:/|$)", fparsed.path or "")
+    if m:
+        return m.group(1), "video"
+    raise RuntimeError(f"không lấy được mã video Douyin từ link: {final[:120]}")
+
+
+def fetch_douyin_item(video_id, kind="video"):
+    """Đọc trang chia sẻ iesdouyin, trả dict item của video/bài ảnh.
+    Thử cả share/video và share/note, mỗi trang tối đa 3 lần (lần đầu
+    thường chỉ để lấy cookie ttwid nên chưa có dữ liệu)."""
+    kinds = [kind, "note" if kind == "video" else "video"]
+    last_err = None
+    for k in kinds:
+        share_url = f"https://www.iesdouyin.com/share/{k}/{video_id}/"
+        for i in range(3):
+            try:
+                req = urllib.request.Request(
+                    share_url, headers={"User-Agent": MOBILE_UA})
+                with DOUYIN_OPENER.open(req, timeout=25) as r:
+                    html = r.read().decode("utf-8", "ignore")
+                data = _douyin_parse_router_data(html)
+                item = _douyin_find_item(data) if data else None
+                if item:
+                    return item
+                last_err = "trang chia sẻ chưa có dữ liệu video"
+                log(f"Douyin {k} lần {i + 1} chưa có item (len={len(html)})")
+            except Exception as e:  # noqa: BLE001 - thử lại / đổi loại trang
+                last_err = e
+                log(f"Đọc trang Douyin {k} lần {i + 1} lỗi: {e}")
+            time.sleep(1.5 * (i + 1))
+    raise RuntimeError(f"không đọc được dữ liệu Douyin: {last_err}")
+
+
+def douyin_cover_url(item):
+    video = item.get("video") or {}
+    for key in ("cover", "origin_cover", "dynamic_cover"):
+        urls = (video.get(key) or {}).get("url_list") or []
+        if urls:
+            return urls[0]
+    return None
+
+
+def douyin_image_urls(item):
+    """Link ảnh của bài đăng ảnh Douyin (tối đa 10, đã lọc trùng)."""
+    candidates = []
+    if isinstance(item.get("images"), list):
+        candidates.extend(item["images"])
+    info = item.get("image_post_info") or {}
+    if isinstance(info.get("images"), list):
+        candidates.extend(info["images"])
+    out, seen = [], set()
+    for entry in candidates:
+        url = None
+        if isinstance(entry, dict):
+            urls = entry.get("url_list") or []
+            if not urls:
+                for sub in ("display_image", "thumbnail", "download_url"):
+                    urls = (entry.get(sub) or {}).get("url_list") or []
+                    if urls:
+                        break
+            if urls:
+                url = urls[0]
+        elif isinstance(entry, str) and entry.startswith("http"):
+            url = entry
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out[:10]
+
+
+def douyin_play_url(uri, ratio="720p"):
+    return (f"https://aweme.snssdk.com/aweme/v1/play/"
+            f"?video_id={uri}&ratio={ratio}&line=0")
+
+
+def douyin_play_candidates(item):
+    """Các link phát Douyin xếp tốt -> nhẹ: bản gốc (default), các mức
+    bit_rate nếu có, rồi 720p/540p. Đã đổi playwm -> play (không logo)."""
+    video = item.get("video") or {}
+    play_addr = video.get("play_addr") or {}
+    uri = play_addr.get("uri")
+    cands, seen = [], set()
+
+    def add(label, url):
+        if url:
+            url = url.replace("playwm", "play")
+            if url not in seen:
+                seen.add(url)
+                cands.append((label, url))
+
+    if uri:
+        add("gốc", douyin_play_url(uri, "default"))
+    rates = [b for b in (video.get("bit_rate") or []) if isinstance(b, dict)]
+    rates.sort(key=lambda b: b.get("bit_rate") or 0, reverse=True)
+    for b in rates:
+        urls = (b.get("play_addr") or {}).get("url_list") or []
+        if urls:
+            add(f"{b.get('height') or '?'}p", urls[0])
+    for u in play_addr.get("url_list") or []:
+        add("720p", u)
+    if uri:
+        add("720p", douyin_play_url(uri, "720p"))
+        add("540p", douyin_play_url(uri, "540p"))
+    return cands
+
+
+def probe_remote_size(url):
+    """Dung lượng file từ xa (byte) qua request Range 1 byte, None nếu
+    không đọc được. Dùng để chọn bản vừa giới hạn 45MB của Telegram."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": MOBILE_UA, "Referer": DOUYIN_REFERER,
+            "Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read(1)
+            crange = r.headers.get("Content-Range") or ""
+            if "/" in crange:
+                total = crange.rsplit("/", 1)[-1].strip()
+                if total.isdigit():
+                    return int(total)
+            clen = r.headers.get("Content-Length")
+            if clen and str(clen).isdigit():
+                return int(clen)
+    except Exception as e:  # noqa: BLE001 - không đọc được thì tải thử
+        log(f"Đo dung lượng Douyin lỗi: {e}")
+    return None
+
+
+def download_douyin_file(url, max_bytes=120_000_000):
+    """Tải file video Douyin về thư mục tạm, trả (đường dẫn, thư mục).
+    CDN Douyin cần UA trình duyệt + Referer douyin.com."""
+    tmpdir = tempfile.mkdtemp(prefix="timenow_douyin_")
+    path = os.path.join(tmpdir, "video.mp4")
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": MOBILE_UA, "Referer": DOUYIN_REFERER})
+        total = 0
+        with urllib.request.urlopen(req, timeout=180) as r, \
+                open(path, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("Video nặng hơn giới hạn tải")
+                f.write(chunk)
+        if total == 0:
+            raise RuntimeError("file video Douyin rỗng")
+        return path, tmpdir
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+
+def extract_mp3_from_video(video_path, tmpdir):
+    """Tách nhạc MP3 từ file video bằng ffmpeg. Trả (đường dẫn, tên file)
+    hoặc (None, None) nếu không tách được (video không có tiếng...)."""
+    ff = ffmpeg_exe()
+    if not ff:
+        return None, None
+    out = os.path.join(tmpdir, "nhac.mp3")
+    cmd = [ff, "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame",
+           "-b:a", "128k", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+        return out, "nhac.mp3"
+    log(f"Tách MP3 Douyin lỗi: {(r.stderr or '').strip()[-200:]}")
+    out2 = os.path.join(tmpdir, "nhac.m4a")
+    cmd2 = [ff, "-y", "-i", video_path, "-vn", "-c:a", "aac",
+            "-b:a", "128k", out2]
+    r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=180)
+    if r2.returncode == 0 and os.path.exists(out2) and os.path.getsize(out2) > 0:
+        return out2, "nhac.m4a"
+    return None, None
+
+
+def douyin_send_music_by_uri(chat_id, uri):
+    """Tải lại bản 720p rồi tách MP3 gửi cho người dùng (nút lấy nhạc /
+    nhắn 'nhac' cho link Douyin vừa tải). Trả True nếu gửi được."""
+    tmpdir = None
+    try:
+        path, tmpdir = download_douyin_file(douyin_play_url(uri, "720p"))
+        mp3, fname = extract_mp3_from_video(path, tmpdir)
+        if not mp3:
+            return False
+        tg_multipart_audio(chat_id, mp3, fname, "🎵 Nhạc nền của video")
+        return True
+    except Exception as e:  # noqa: BLE001 - caller báo lỗi gọn
+        log(f"Gửi lại nhạc Douyin lỗi: {e}")
+        return False
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def douyin_send_sd_by_uri(chat_id, uri):
+    """Tải bản thường 540p của Douyin rồi upload (nút Bản thường)."""
+    tmpdir = None
+    try:
+        path, tmpdir = download_douyin_file(douyin_play_url(uri, "540p"))
+        path = reencode_fit(path, tmpdir, 0)
+        tg_multipart_video(chat_id, path, "video.mp4",
+                           "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
+        return True
+    except Exception as e:  # noqa: BLE001 - caller báo lỗi gọn
+        log(f"Tải bản thường Douyin lỗi: {e}")
+        return False
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def handle_douyin(chat_id, url):
+    send(chat_id, "⏳ Đang tải Douyin cho Huy đây, chờ mình vài giây nhé...")
+    try:
+        video_id, kind = resolve_douyin_id(url)
+        item = fetch_douyin_item(video_id, kind)
+    except Exception as e:  # noqa: BLE001 - báo lỗi gọn cho người dùng
+        log(f"Tải Douyin thất bại: {e}")
+        send_error(chat_id, "Không tải được link Douyin này, thử lại sau "
+                            "vài phút nhé. (Chỉ tải được video công khai, "
+                            "một số video bị khóa theo khu vực.)",
+                   failed_url=url, platform="Douyin")
+        return
+    author = item.get("author") or {}
+    nick = author.get("nickname") or "Douyin"
+    unique = author.get("unique_id") or author.get("short_id") or ""
+    title = (item.get("desc") or "").strip()
+    video = item.get("video") or {}
+    dur = int((video.get("duration") or 0) // 1000)
+    stats = item.get("statistics") or {}
+    caption = f"🎬 Douyin • @{unique} ({nick})\n{title}"
+    if dur:
+        caption += f"\n⏱ {dur // 60}:{dur % 60:02d}" if dur >= 60 else f"\n⏱ {dur}s"
+        caption += (f" • ❤️ {fmt_num(stats.get('digg_count'))}"
+                    f" • 💬 {fmt_num(stats.get('comment_count'))}")
+    uri = (video.get("play_addr") or {}).get("uri")
+    sent = set()
+    # Bài đăng ảnh -> gửi từng ảnh.
+    images = douyin_image_urls(item)
+    if images and not uri:
+        ok = False
+        for i, img in enumerate(images):
+            try:
+                send_photo(chat_id, img, caption if i == 0 else "")
+                ok = True
+            except Exception as e:  # noqa: BLE001 - ảnh lỗi thì gửi ảnh khác
+                log(f"Gửi ảnh Douyin {i} lỗi: {e}")
+        if not ok:
+            send_error(chat_id, "Không tải được bài ảnh Douyin này, thử "
+                                "lại sau vài phút nhé.",
+                       failed_url=url, platform="Douyin")
+            return
+        sent.add("anh")
+        save_download(chat_id, orig=url, platform="Douyin", music=None,
+                      douyin_uri=None, douyin_id=video_id, douyin_kind=kind)
+        bump_stat("Douyin")
+        record_download(chat_id, "Douyin")
+        notify_admin_download(chat_id, "Douyin", url)
+        send_done(chat_id, sent, url)
+        return
+    # Video -> ảnh bìa trước, rồi file video, rồi nhạc tách từ video.
+    cover = douyin_cover_url(item)
+    if cover:
+        try:
+            send_photo(chat_id, cover, caption)
+            sent.add("anh")
+        except Exception as e:  # noqa: BLE001 - bìa lỗi thì vẫn gửi video
+            log(f"Gửi ảnh bìa Douyin lỗi: {e}")
+    cands = douyin_play_candidates(item)
+    if not cands:
+        send_error(chat_id, "Không tải được link Douyin này, thử lại sau "
+                            "vài phút nhé.",
+                   failed_url=url, platform="Douyin")
+        return
+    # Chọn bản tốt nhất vừa 45MB; không đo được dung lượng thì tải thử
+    # bản đầu tiên rồi nén lại nếu nặng quá.
+    chosen = cands[0][1]
+    for _label, cand in cands:
+        size = probe_remote_size(cand)
+        if size is not None and size <= MAX_VIDEO_BYTES:
+            chosen = cand
+            break
+        if size is not None:
+            chosen = cand  # vẫn nặng: giữ bản nhẹ hơn ở vòng sau / nén lại
+    tmpdir = None
+    video_sent = False
+    try:
+        path, tmpdir = download_douyin_file(chosen)
+        path = reencode_fit(path, tmpdir, dur)
+        tg_multipart_video(chat_id, path, "video.mp4",
+                           "" if "anh" in sent else caption)
+        video_sent = True
+        sent.add("video")
+        # Tách nhạc MP3 từ chính file vừa tải (Douyin không cho link nhạc
+        # riêng trong dữ liệu SSR như TikWM).
+        try:
+            mp3, fname = extract_mp3_from_video(path, tmpdir)
+            if mp3:
+                tg_multipart_audio(chat_id, mp3, fname,
+                                   "🎵 Nhạc nền của video")
+                sent.add("nhac")
+        except Exception as e:  # noqa: BLE001 - nhạc lỗi thì vẫn còn video
+            log(f"Tách/gửi nhạc Douyin lỗi: {e}")
+    except Exception as e:  # noqa: BLE001 - thử gửi bằng link dự phòng
+        log(f"Tải/upload video Douyin lỗi: {e}")
+        try:
+            send_video(chat_id, chosen, "" if "anh" in sent else caption)
+            video_sent = True
+            sent.add("video")
+        except Exception as e2:  # noqa: BLE001 - hết cách thì báo lỗi
+            log(f"Gửi video Douyin bằng link lỗi: {e2}")
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if not video_sent:
+        send_error(chat_id, "Không tải được video Douyin này (nặng quá "
+                            "hoặc link lỗi), thử lại sau vài phút nhé.",
+                   failed_url=url, platform="Douyin")
+        return
+    save_download(chat_id, orig=url, platform="Douyin", music=None,
+                  douyin_uri=uri, douyin_id=video_id, douyin_kind=kind)
+    bump_stat("Douyin")
+    record_download(chat_id, "Douyin")
+    notify_admin_download(chat_id, "Douyin", url)
+    send_done(chat_id, sent, url)
+
+
 def handle_generic(chat_id, url, platform):
     """Tải video YouTube / Instagram / Facebook / X: tải + gộp rồi upload file.
     (Các nền tảng này chỉ có luồng hình và tiếng riêng, không có sẵn file gộp.)"""
@@ -953,11 +1361,13 @@ def send_done(chat_id, sent, orig_url):
             " ở trên, thích cái nào thì tải cái đó nhé.")
     dl = LAST_DOWNLOAD.get(chat_id) or {}
     row = []
-    if dl.get("music"):
+    if dl.get("music") or (dl.get("platform") == "Douyin"
+                           and dl.get("douyin_uri")):
         row.append({"text": "🎵 Lấy lại nhạc", "callback_data": "dl:music"})
     # Nền tảng đa luồng (YouTube/IG/FB/X): nút bản thường tải lại bản 480p.
+    # Douyin: nút bản thường tải lại bản 540p.
     if dl.get("sd") or dl.get("platform") in ("YouTube", "Instagram",
-                                             "Facebook", "X"):
+                                             "Facebook", "X", "Douyin"):
         row.append({"text": "📥 Bản thường", "callback_data": "dl:sd"})
     kb = {"inline_keyboard": []}
     if row:
@@ -1037,6 +1447,10 @@ def handle_callback(chat_id, data):
                 send_music_file(chat_id, music, "🎵 Nhạc nền TikTok")
             except Exception:  # noqa: BLE001 - gửi link thay cho file
                 send(chat_id, f"Gửi file nhạc lỗi, Huy bấm link này để tải: {music}")
+        elif dl.get("platform") == "Douyin" and dl.get("douyin_uri"):
+            send(chat_id, "⏳ Đang tách nhạc Douyin, chờ mình chút nhé...")
+            if not douyin_send_music_by_uri(chat_id, dl["douyin_uri"]):
+                send(chat_id, "Tách nhạc Douyin lỗi, thử lại sau nhé.")
         else:
             send(chat_id, "Link vừa tải không có nhạc.")
     elif data == "dl:sd":
@@ -1054,6 +1468,10 @@ def handle_callback(chat_id, data):
                                "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
             else:
                 send_video(chat_id, sd, "📥 Bản thường (nhẹ hơn, tải nhanh hơn)")
+        elif dl.get("platform") == "Douyin" and dl.get("douyin_uri"):
+            send(chat_id, "⏳ Đang tải bản thường Douyin, chờ mình chút nhé...")
+            if not douyin_send_sd_by_uri(chat_id, dl["douyin_uri"]):
+                send(chat_id, "Tải bản thường Douyin lỗi, thử lại sau nhé.")
         elif dl.get("platform") in ("YouTube", "Instagram", "Facebook", "X") \
                 and dl.get("orig"):
             send(chat_id, "⏳ Đang tải bản thường, chờ mình chút nhé...")
@@ -1142,7 +1560,7 @@ def handle_update(update):
         card = ("👋 Chào bạn, mình là bot TimeNow.\n"
                 "Gửi link vào đây, mình gửi đủ cả ảnh bìa, video "
                 "không logo và nhạc MP3 để bạn thích cái nào thì tải cái đó.\n\n"
-                "📱 Tải được: TikTok, YouTube, Instagram, Facebook, X\n"
+                "📱 Tải được: TikTok, Douyin, YouTube, Instagram, Facebook, X\n"
                 "📎 Gửi nhiều link trong 1 tin nhắn (tối đa 3) để tải hàng loạt\n"
                 "🎵 Nhắn 'nhac' để gửi lại file nhạc của link vừa tải\n"
                 "🆘 Gặp sự cố thì bấm nút 'Cần hỗ trợ' hoặc gõ /hotro\n"
@@ -1159,7 +1577,7 @@ def handle_update(update):
         send(chat_id,
              "📖 Hướng dẫn dùng bot TimeNow\n\n"
              "📎 Gửi link video vào đây, bot tải về gửi lại cho bạn:\n"
-             "• TikTok — ảnh bìa + video không logo + nhạc MP3\n"
+             "• TikTok, Douyin — ảnh bìa + video không logo + nhạc MP3\n"
              "• YouTube, Instagram, Facebook, X — video + ảnh bìa + nhạc\n"
              "• Gửi nhiều link trong 1 tin nhắn (tối đa 3) để tải hàng loạt\n\n"
              "🔘 Sau khi tải xong, bấm nút dưới tin nhắn để:\n"
@@ -1257,13 +1675,18 @@ def handle_update(update):
     if low in ("nhac", "mp3", "🎵", "nhạc"):
         with LOCK:
             music = LAST_MUSIC.get(chat_id)
+            dl_nhac = dict(LAST_DOWNLOAD.get(chat_id) or {})
         if music:
             try:
                 send_music_file(chat_id, music, "🎵 Nhạc nền TikTok")
             except Exception:  # noqa: BLE001 - gửi link thay cho file
                 send(chat_id, f"Gửi file nhạc lỗi, Huy bấm link này để tải: {music}")
+        elif dl_nhac.get("platform") == "Douyin" and dl_nhac.get("douyin_uri"):
+            send(chat_id, "⏳ Đang tách nhạc Douyin, chờ mình chút nhé...")
+            if not douyin_send_music_by_uri(chat_id, dl_nhac["douyin_uri"]):
+                send(chat_id, "Tách nhạc Douyin lỗi, thử lại sau nhé.")
         else:
-            send(chat_id, "Bạn chưa tải video nào, gửi link TikTok trước nhé.")
+            send(chat_id, "Bạn chưa tải video nào, gửi link trước nhé.")
         return
 
     # ---- Có link trong tin nhắn (tối đa 3 link 1 lần) ----
@@ -1276,11 +1699,14 @@ def handle_update(update):
             platform = platform_of(host)
             if platform == "TikTok":
                 handle_tiktok(chat_id, url)
+            elif platform == "Douyin":
+                handle_douyin(chat_id, url)
             elif platform:
                 handle_generic(chat_id, url, platform)
             else:
                 send(chat_id, "Link này bot chưa tải được, hiện tải được "
-                              "TikTok, YouTube, Instagram, Facebook, X nhé.")
+                              "TikTok, Douyin, YouTube, Instagram, "
+                              "Facebook, X nhé.")
         return
 
     # ---- Người dùng đang cần hỗ trợ: chuyển tiếp tin nhắn cho admin ----
@@ -1321,8 +1747,9 @@ def handle_update(update):
 
     # ---- Người lạ nhắn chữ ----
     if text:
-        send(chat_id, "Gửi link TikTok, YouTube, Instagram, Facebook hoặc X "
-                      "vào đây, mình tải video/ảnh/nhạc gửi lại cho bạn nhé.")
+        send(chat_id, "Gửi link TikTok, Douyin, YouTube, Instagram, "
+                      "Facebook hoặc X vào đây, mình tải video/ảnh/nhạc "
+                      "gửi lại cho bạn nhé.")
 
 
 class Handler(BaseHTTPRequestHandler):
