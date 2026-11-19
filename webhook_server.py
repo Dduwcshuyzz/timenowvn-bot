@@ -8,6 +8,8 @@ Cách hoạt động: Telegram đẩy tin nhắn tới server ngay khi có ngư�
   -> bot gửi đủ ảnh bìa, video không logo và nhạc MP3 một lần.
   Douyin (v12) đọc trang chia sẻ iesdouyin (SSR) bằng cookie khách
   ttwid, không cần đăng nhập; nhạc MP3 tách từ file video bằng ffmpeg.
+  Video Douyin quá nặng so với giới hạn Telegram (thường là video dài)
+  thì gửi link tải trực tiếp theo từng mức chất lượng thay vì báo lỗi.
 - Gửi nhiều link trong 1 tin nhắn (tối đa 3) -> bot tải từng cái.
 - Sau khi tải xong có nút bấm: lấy lại nhạc, tải bản thường, mở link gốc.
 - Nhắn "nhac" sau khi tải video -> bot gửi lại file nhạc MP3.
@@ -1162,6 +1164,23 @@ def douyin_send_sd_by_uri(chat_id, uri):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def send_douyin_links(chat_id, cands, sizes):
+    """Video Douyin quá nặng để bot gửi file (Telegram giới hạn ~50MB,
+    thường là video dài): gửi link tải trực tiếp theo từng mức chất
+    lượng để người dùng tự tải bằng trình duyệt."""
+    lines = ["📥 Video này dài/nặng quá nên Telegram không cho bot gửi "
+             "file trực tiếp. Huy bấm nút dưới đây để tải nhé (link chỉ "
+             "dùng được trong vài giờ):"]
+    rows = []
+    for label, cand in cands:
+        name = f"📥 Bản {label}"
+        size = sizes.get(cand)
+        if size:
+            name += f" ({size / 1_000_000:.0f}MB)"
+        rows.append([{"text": name, "url": cand}])
+    send_markup(chat_id, "\n".join(lines), {"inline_keyboard": rows})
+
+
 def handle_douyin(chat_id, url):
     send(chat_id, "⏳ Đang tải Douyin cho Huy đây, chờ mình vài giây nhé...")
     try:
@@ -1226,10 +1245,13 @@ def handle_douyin(chat_id, url):
                    failed_url=url, platform="Douyin")
         return
     # Chọn bản tốt nhất vừa 45MB; không đo được dung lượng thì tải thử
-    # bản đầu tiên rồi nén lại nếu nặng quá.
+    # bản đầu tiên rồi nén lại nếu nặng quá. Ghi lại dung lượng từng bản
+    # để gửi link tải trực tiếp nếu video quá nặng.
     chosen = cands[0][1]
-    for _label, cand in cands:
+    sizes = {}
+    for label, cand in cands:
         size = probe_remote_size(cand)
+        sizes[cand] = size
         if size is not None and size <= MAX_VIDEO_BYTES:
             chosen = cand
             break
@@ -1266,9 +1288,14 @@ def handle_douyin(chat_id, url):
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
     if not video_sent:
-        send_error(chat_id, "Không tải được video Douyin này (nặng quá "
-                            "hoặc link lỗi), thử lại sau vài phút nhé.",
-                   failed_url=url, platform="Douyin")
+        # Video quá nặng so với giới hạn 45-50MB của Telegram (thường là
+        # video dài): gửi link tải trực tiếp thay vì báo lỗi.
+        send_douyin_links(chat_id, cands, sizes)
+        save_download(chat_id, orig=url, platform="Douyin", music=None,
+                      douyin_uri=uri, douyin_id=video_id, douyin_kind=kind)
+        bump_stat("Douyin")
+        record_download(chat_id, "Douyin")
+        notify_admin_download(chat_id, "Douyin", url)
         return
     save_download(chat_id, orig=url, platform="Douyin", music=None,
                   douyin_uri=uri, douyin_id=video_id, douyin_kind=kind)
